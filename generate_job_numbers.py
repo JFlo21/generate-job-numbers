@@ -11,10 +11,13 @@ API_TOKEN = os.getenv("SMARTSHEET_API_TOKEN")
 # --- IDs ---
 SOURCE_SHEET_ID = 3239244454645636
 STATE_SHEET_ID = 6534534683119492
+# New sheet for looking up Dept # by Foreman
+DEPT_MAPPING_SHEET_ID = 7060626703601540
 
-# Column IDs from your SOURCE sheet
+
+# Column IDs from your SOURCE sheet (where data is pasted)
 COLUMN_MAP = {
-    'dept': 6997862724620164,
+    'dept': 6997862724620164,      # This is still needed for context but will NOT be used for the logic
     'wr_num': 3620163004092292,
     'foreman': 5476104938409860,
     'job_num': 2545575356223364,
@@ -26,6 +29,13 @@ STATE_COLUMN_MAP = {
     'value': 4304795202178948
 }
 
+# Column IDs from your new DEPT MAPPING sheet
+DEPT_MAPPING_COLUMN_MAP = {
+    'dept': 8098055590727556,
+    'foreman': 77970619625050
+}
+
+
 # --- Constants ---
 JOB_NUMBER_PREFIX = "568-"
 STATE_SHEET_KEY_CELL = "StateData" # A key to identify the state row
@@ -33,17 +43,49 @@ STATE_SHEET_KEY_CELL = "StateData" # A key to identify the state row
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+
+def create_foreman_dept_map(client):
+    """
+    Fetches the Dept Mapping sheet and creates an efficient lookup dictionary.
+    This map will provide the definitive Dept # for each Foreman.
+    Returns a dictionary like: {'Foreman Name': 'Dept Number'}
+    """
+    logging.info(f"Creating Foreman to Dept # mapping from Sheet ID: {DEPT_MAPPING_SHEET_ID}")
+    foreman_to_dept = {}
+    
+    try:
+        mapping_sheet = client.Sheets.get_sheet(DEPT_MAPPING_SHEET_ID)
+        
+        for row in mapping_sheet.rows:
+            row_cells = {cell.column_id: cell for cell in row.cells}
+            
+            foreman_cell = row_cells.get(DEPT_MAPPING_COLUMN_MAP['foreman'])
+            dept_cell = row_cells.get(DEPT_MAPPING_COLUMN_MAP['dept'])
+
+            # Use display_value for robustness
+            foreman_name = foreman_cell.display_value if foreman_cell and foreman_cell.display_value else None
+            dept_num = dept_cell.display_value if dept_cell and dept_cell.display_value else None
+
+            if foreman_name and dept_num:
+                foreman_to_dept[foreman_name] = dept_num
+            else:
+                logging.warning(f"Skipping row {row.row_number} in Dept Mapping Sheet due to missing Foreman or Dept #.")
+
+        logging.info(f"✅ Successfully created map for {len(foreman_to_dept)} foremen.")
+        return foreman_to_dept
+
+    except Exception as e:
+        logging.error(f"FATAL: Could not create Foreman to Dept # map. Error: {e}")
+        raise # Stop execution if the mapping can't be created
+
 def load_state(client):
     """
     Loads the last known state from the State Sheet.
-    The state is a JSON string stored in a single cell.
-    Returns an empty dictionary if no state is found.
     """
     logging.info(f"Loading state from State Sheet ID: {STATE_SHEET_ID}")
     try:
         state_sheet = client.Sheets.get_sheet(STATE_SHEET_ID)
         for row in state_sheet.rows:
-            # Find the state row by its key in the 'StateKey' column
             key_cell = next((cell for cell in row.cells if cell.column_id == STATE_COLUMN_MAP['key']), None)
             if key_cell and key_cell.value == STATE_SHEET_KEY_CELL:
                 value_cell = next((cell for cell in row.cells if cell.column_id == STATE_COLUMN_MAP['value']), None)
@@ -76,18 +118,13 @@ def save_state(client, state_data):
                 break
 
         if state_row_id:
-            # Update existing row
             logging.info(f"Updating existing state row (ID: {state_row_id})...")
             update_row = smartsheet.models.Row()
             update_row.id = state_row_id
-            update_row.cells.append({
-                'column_id': STATE_COLUMN_MAP['value'],
-                'value': state_json
-            })
+            update_row.cells.append({'column_id': STATE_COLUMN_MAP['value'], 'value': state_json})
             client.Sheets.update_rows(STATE_SHEET_ID, [update_row])
             logging.info("Successfully updated state.")
         else:
-            # Add new row if the state row doesn't exist
             logging.info("State row not found. Creating a new one...")
             new_row = smartsheet.models.Row()
             new_row.to_top = True
@@ -110,6 +147,9 @@ def main():
     client.errors_as_exceptions(True)
 
     try:
+        # 0. Create the Foreman to Dept # lookup map. This is our source of truth.
+        foreman_dept_map = create_foreman_dept_map(client)
+
         # 1. Load the current state from the state sheet
         state = defaultdict(lambda: {'seen_wr': set(), 'count': 0})
         loaded_state = load_state(client)
@@ -127,20 +167,24 @@ def main():
         for row in source_sheet.rows:
             cell_map = {cell.column_id: cell for cell in row.cells}
 
-            dept_cell = cell_map.get(COLUMN_MAP['dept'])
             wr_num_cell = cell_map.get(COLUMN_MAP['wr_num'])
             foreman_cell = cell_map.get(COLUMN_MAP['foreman'])
             job_num_cell = cell_map.get(COLUMN_MAP['job_num'])
 
-            # --- FIX ---
-            # Use display_value for robustness, especially with formula columns.
-            # It gets the value as the user sees it in the UI.
-            dept = dept_cell.display_value if dept_cell and dept_cell.display_value else None
+            # Get values from the main sheet
             wr_num = wr_num_cell.display_value if wr_num_cell and wr_num_cell.display_value else None
             foreman = foreman_cell.display_value if foreman_cell and foreman_cell.display_value else None
             
             # --- Core Logic ---
-            if not dept or not wr_num or not foreman:
+            if not wr_num or not foreman:
+                continue
+
+            # --- NEW LOGIC ---
+            # Look up the Dept # from our map instead of reading it from the source row
+            dept = foreman_dept_map.get(foreman)
+            
+            if not dept:
+                logging.warning(f"Foreman '{foreman}' on row {row.row_number} not found in Dept Mapping Sheet. Skipping.")
                 continue
 
             state_key = f"{dept}_{foreman}"
