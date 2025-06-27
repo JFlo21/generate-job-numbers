@@ -11,15 +11,13 @@ API_TOKEN = os.getenv("SMARTSHEET_API_TOKEN")
 # --- IDs ---
 SOURCE_SHEET_ID = 3239244454645636
 STATE_SHEET_ID = 6534534683119492
-# New sheet for looking up Dept # by Foreman
-DEPT_MAPPING_SHEET_ID = 7060626703601540
-
 
 # Column IDs from your SOURCE sheet (where data is pasted)
+# Using the new, corrected column IDs as requested.
 COLUMN_MAP = {
-    'dept': 6997862724620164,      # This is still needed for context but will NOT be used for the logic
+    'dept': 4959096660512644,
     'wr_num': 3620163004092292,
-    'foreman': 5476104938409860,
+    'foreman': 8134988148723588,
     'job_num': 2545575356223364,
 }
 
@@ -29,54 +27,12 @@ STATE_COLUMN_MAP = {
     'value': 4304795202178948
 }
 
-# Column IDs from your new DEPT MAPPING sheet
-DEPT_MAPPING_COLUMN_MAP = {
-    'dept': 8098055590727556,
-    'foreman': 779706196250500
-}
-
-
 # --- Constants ---
-JOB_NUMBER_PREFIX = "568-"
+# JOB_NUMBER_PREFIX has been removed as it is now dynamic.
 STATE_SHEET_KEY_CELL = "StateData" # A key to identify the state row
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-
-def create_foreman_dept_map(client):
-    """
-    Fetches the Dept Mapping sheet and creates an efficient lookup dictionary.
-    This map will provide the definitive Dept # for each Foreman.
-    Returns a dictionary like: {'Foreman Name': 'Dept Number'}
-    """
-    logging.info(f"Creating Foreman to Dept # mapping from Sheet ID: {DEPT_MAPPING_SHEET_ID}")
-    foreman_to_dept = {}
-    
-    try:
-        mapping_sheet = client.Sheets.get_sheet(DEPT_MAPPING_SHEET_ID)
-        
-        for row in mapping_sheet.rows:
-            row_cells = {cell.column_id: cell for cell in row.cells}
-            
-            foreman_cell = row_cells.get(DEPT_MAPPING_COLUMN_MAP['foreman'])
-            dept_cell = row_cells.get(DEPT_MAPPING_COLUMN_MAP['dept'])
-
-            # Use display_value for robustness
-            foreman_name = foreman_cell.display_value if foreman_cell and foreman_cell.display_value else None
-            dept_num = dept_cell.display_value if dept_cell and dept_cell.display_value else None
-
-            if foreman_name and dept_num:
-                foreman_to_dept[foreman_name] = dept_num
-            else:
-                logging.warning(f"Skipping row {row.row_number} in Dept Mapping Sheet due to missing Foreman or Dept #.")
-
-        logging.info(f"✅ Successfully created map for {len(foreman_to_dept)} foremen.")
-        return foreman_to_dept
-
-    except Exception as e:
-        logging.error(f"FATAL: Could not create Foreman to Dept # map. Error: {e}")
-        raise # Stop execution if the mapping can't be created
 
 def load_state(client):
     """
@@ -147,9 +103,6 @@ def main():
     client.errors_as_exceptions(True)
 
     try:
-        # 0. Create the Foreman to Dept # lookup map. This is our source of truth.
-        foreman_dept_map = create_foreman_dept_map(client)
-
         # 1. Load the current state from the state sheet
         state = defaultdict(lambda: {'seen_wr': set(), 'count': 0})
         loaded_state = load_state(client)
@@ -167,33 +120,32 @@ def main():
         for row in source_sheet.rows:
             cell_map = {cell.column_id: cell for cell in row.cells}
 
+            # Get cells using the correct column IDs from COLUMN_MAP
+            dept_cell = cell_map.get(COLUMN_MAP['dept'])
             wr_num_cell = cell_map.get(COLUMN_MAP['wr_num'])
             foreman_cell = cell_map.get(COLUMN_MAP['foreman'])
             job_num_cell = cell_map.get(COLUMN_MAP['job_num'])
 
-            # Get values from the main sheet
+            # Use .display_value to get the final calculated value the user sees
+            dept = dept_cell.display_value if dept_cell and dept_cell.display_value else None
             wr_num = wr_num_cell.display_value if wr_num_cell and wr_num_cell.display_value else None
             foreman = foreman_cell.display_value if foreman_cell and foreman_cell.display_value else None
             
-            # --- Core Logic ---
-            if not wr_num or not foreman:
+            # Skip any row that doesn't have the essential data points
+            if not dept or not wr_num or not foreman:
                 continue
 
-            # --- NEW LOGIC ---
-            # Look up the Dept # from our map instead of reading it from the source row
-            dept = foreman_dept_map.get(foreman)
-            
-            if not dept:
-                logging.warning(f"Foreman '{foreman}' on row {row.row_number} not found in Dept Mapping Sheet. Skipping.")
-                continue
-
+            # Create a unique key for the Dept+Foreman combination. This is the core of the counter.
             state_key = f"{dept}_{foreman}"
             
+            # If the WR# for this combo has NOT been seen before, it's a new job, so increment the count.
             if wr_num not in state[state_key]['seen_wr']:
                 state[state_key]['count'] += 1
                 state[state_key]['seen_wr'].add(wr_num)
 
-            new_job_number = f"{JOB_NUMBER_PREFIX}{state[state_key]['count']}"
+            # --- NEW LOGIC ---
+            # Generate the new job number using the dept number from the row as the dynamic prefix.
+            new_job_number = f"{dept}-{state[state_key]['count']}"
             
             current_job_number = job_num_cell.display_value if job_num_cell else None
             if new_job_number != current_job_number:
