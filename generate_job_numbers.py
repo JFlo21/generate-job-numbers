@@ -132,9 +132,12 @@ def main():
             foreman_cell = cell_map.get(COLUMN_MAP['foreman'])
             job_num_cell = cell_map.get(COLUMN_MAP['job_num'])
 
-            dept = str(dept_cell.value) if dept_cell and dept_cell.value else None
-            wr_num = str(wr_num_cell.value) if wr_num_cell and wr_num_cell.value else None
-            foreman = str(foreman_cell.value) if foreman_cell and foreman_cell.value else None
+            # --- FIX ---
+            # Use display_value for robustness, especially with formula columns.
+            # It gets the value as the user sees it in the UI.
+            dept = dept_cell.display_value if dept_cell and dept_cell.display_value else None
+            wr_num = wr_num_cell.display_value if wr_num_cell and wr_num_cell.display_value else None
+            foreman = foreman_cell.display_value if foreman_cell and foreman_cell.display_value else None
             
             # --- Core Logic ---
             if not dept or not wr_num or not foreman:
@@ -148,7 +151,7 @@ def main():
 
             new_job_number = f"{JOB_NUMBER_PREFIX}{state[state_key]['count']}"
             
-            current_job_number = job_num_cell.value if job_num_cell else None
+            current_job_number = job_num_cell.display_value if job_num_cell else None
             if new_job_number != current_job_number:
                 update_row = smartsheet.models.Row()
                 update_row.id = row.id
