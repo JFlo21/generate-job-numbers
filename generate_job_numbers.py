@@ -32,7 +32,7 @@ STATE_COLUMN_MAP = {
 # Column IDs from your new DEPT MAPPING sheet
 DEPT_MAPPING_COLUMN_MAP = {
     'dept': 8098055590727556,
-    'foreman': 77970619625050
+    'foreman': 779706196250500
 }
 
 
