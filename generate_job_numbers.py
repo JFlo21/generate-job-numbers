@@ -132,7 +132,7 @@ def save_state(client, state_data):
         raise
 
 def main():
-    """Main execution function with new two-pass logic."""
+    """Main execution function with new three-pass logic."""
     if not API_TOKEN:
         logging.error("FATAL: SMARTSHEET_API_TOKEN environment variable not set.")
         return
@@ -141,7 +141,7 @@ def main():
     client.errors_as_exceptions(True)
 
     try:
-        # 1. Load configurations and the new, combined state
+        # 1. Load configurations and the historical state
         sheet_configs = load_sheet_mapping(client)
         if not sheet_configs:
             logging.error("Execution halted: No valid sheet configurations were loaded.")
@@ -160,7 +160,6 @@ def main():
             try:
                 source_sheet = client.Sheets.get_sheet(sheet_id, include=['objectValue'])
                 for row in source_sheet.rows:
-                    # Store row object with its sheet_id and column_map for later processing
                     all_rows_to_process.append({
                         'row_obj': row,
                         'sheet_id': sheet_id,
@@ -169,51 +168,67 @@ def main():
             except smartsheet.exceptions.ApiError as e:
                 logging.error(f"Could not access sheet ID {sheet_id}. Skipping. Error: {e.error.result}")
         
-        logging.info(f"Total rows to process across all sheets: {len(all_rows_to_process)}")
+        logging.info(f"Total rows fetched across all sheets: {len(all_rows_to_process)}")
 
-        # 3. PASS 2: Process all rows to identify duplicates and determine updates
-        logging.info("--- Pass 2: Processing all rows for duplicate detection ---")
-        updates_by_sheet = defaultdict(list)
+        # 3. PASS 2: Calculate final job numbers for each unique Work Request #
+        logging.info("--- Pass 2: Calculating job numbers for unique Work Requests ---")
+        job_assignments_for_this_run = {}
+        unique_wr_nums_processed_this_run = set()
+
         for item in all_rows_to_process:
             row = item['row_obj']
-            sheet_id = item['sheet_id']
             column_map = item['column_map']
-            
             cell_map = {cell.column_id: cell for cell in row.cells}
 
             dept_cell = cell_map.get(column_map['dept'])
             wr_num_cell = cell_map.get(column_map['wr_num'])
-            job_num_cell = cell_map.get(column_map['job_num'])
-
+            
             dept = dept_cell.display_value if dept_cell and dept_cell.display_value else None
             wr_num = wr_num_cell.display_value if wr_num_cell and wr_num_cell.display_value else None
-            
-            if not dept or not wr_num:
-                continue
 
-            new_job_number = None
-            # --- NEW CORE LOGIC ---
+            if not dept or not wr_num or wr_num in unique_wr_nums_processed_this_run:
+                continue
+            
+            # This is the first time we are seeing this WR# in this run.
+            # Decide its job number based on historical state.
             if wr_num not in wr_state:
                 # This is the FIRST time this WR# has ever been seen.
                 dept_counters[dept] += 1
                 base_job_num = f"{dept}-{dept_counters[dept]}"
                 wr_state[wr_num] = {'base_job_num': base_job_num, 'count': 1}
-                new_job_number = base_job_num
+                job_assignments_for_this_run[wr_num] = base_job_num
             else:
-                # This is a DUPLICATE WR#.
+                # This is a DUPLICATE WR# from a previous run.
                 wr_state[wr_num]['count'] += 1
                 base_job_num = wr_state[wr_num]['base_job_num']
-                # The first instance keeps its base number, subsequent ones get a suffix.
-                if wr_state[wr_num]['count'] > 1:
-                    new_job_number = f"{base_job_num}-{wr_state[wr_num]['count']}"
-                    logging.info(f"Duplicate WR# '{wr_num}' found. Original job: '{base_job_num}'. Assigning new job: '{new_job_number}'.")
-                else:
-                    # This case handles re-processing the first instance. Ensure it keeps its base number.
-                    new_job_number = base_job_num
+                new_job_number = f"{base_job_num}-{wr_state[wr_num]['count']}"
+                job_assignments_for_this_run[wr_num] = new_job_number
+                logging.info(f"Duplicate WR# '{wr_num}' from a previous run found. Original job: '{base_job_num}'. Assigning new job: '{new_job_number}'.")
+
+            unique_wr_nums_processed_this_run.add(wr_num)
+
+        # 4. PASS 3: Prepare batch updates for all rows
+        logging.info("--- Pass 3: Preparing batch updates for all sheets ---")
+        updates_by_sheet = defaultdict(list)
+        for item in all_rows_to_process:
+            row = item['row_obj']
+            sheet_id = item['sheet_id']
+            column_map = item['column_map']
+            cell_map = {cell.column_id: cell for cell in row.cells}
+
+            wr_num_cell = cell_map.get(column_map['wr_num'])
+            job_num_cell = cell_map.get(column_map['job_num'])
             
-            # Compare and prepare the update if necessary
+            wr_num = wr_num_cell.display_value if wr_num_cell and wr_num_cell.display_value else None
+            
+            if not wr_num or wr_num not in job_assignments_for_this_run:
+                continue
+
+            # Assign the pre-calculated job number
+            new_job_number = job_assignments_for_this_run[wr_num]
             current_job_number = job_num_cell.display_value if job_num_cell else None
-            if new_job_number and new_job_number != current_job_number:
+
+            if new_job_number != current_job_number:
                 update_row = smartsheet.models.Row()
                 update_row.id = row.id
                 update_row.cells.append({
@@ -223,7 +238,7 @@ def main():
                 })
                 updates_by_sheet[sheet_id].append(update_row)
 
-        # 4. Perform all batch updates
+        # 5. Perform all batch updates
         logging.info("--- Final Step: Sending all batch updates ---")
         if not updates_by_sheet:
             logging.info("No changes detected across any sheets. Job numbers are up-to-date.")
@@ -233,7 +248,7 @@ def main():
                 client.Sheets.update_rows(sheet_id, rows_to_update)
                 logging.info(f"✅ Batch update successful for sheet {sheet_id}.")
 
-        # 5. Save the final state
+        # 6. Save the final state
         final_state = {'wr_state': wr_state, 'dept_counters': dict(dept_counters)}
         save_state(client, final_state)
 
