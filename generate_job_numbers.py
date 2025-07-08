@@ -65,12 +65,10 @@ def load_sheet_mapping(client):
 def load_state(client):
     """
     Loads the state from the State Sheet.
-    The state now contains two parts:
-    - wr_state: Tracks each Work Request #.
-    - dept_counters: Tracks the primary job number sequence for each department.
+    The state is a simple dictionary mapping a Work Request # to its job number.
+    e.g., {"WR-123": "532-1"}
     """
     logging.info(f"Loading job number state from State Sheet ID: {STATE_SHEET_ID}")
-    default_state = {'wr_state': {}, 'dept_counters': {}}
     try:
         state_sheet = client.Sheets.get_sheet(STATE_SHEET_ID)
         for row in state_sheet.rows:
@@ -79,28 +77,24 @@ def load_state(client):
                 value_cell = next((cell for cell in row.cells if cell.column_id == STATE_COLUMN_MAP['value']), None)
                 if value_cell and value_cell.value:
                     try:
-                        loaded_data = json.loads(value_cell.value)
-                        # Ensure both keys exist for robustness on subsequent runs
-                        state = {
-                            'wr_state': loaded_data.get('wr_state', {}),
-                            'dept_counters': loaded_data.get('dept_counters', {})
-                        }
-                        logging.info("Found existing job number state. Loading...")
+                        # Directly return the loaded dictionary
+                        state = json.loads(value_cell.value)
+                        logging.info(f"Found existing job number state. Loaded {len(state)} records.")
                         return state
                     except (json.JSONDecodeError, TypeError):
                         logging.warning("State data is malformed. Starting fresh.")
-                        return default_state
+                        return {}
         
         logging.info("No previous job number state found. Starting fresh.")
-        return default_state
+        return {}
     except smartsheet.exceptions.ApiError as e:
         if e.error.result.error_code == 1006:
             logging.warning("State Sheet not found. Cannot load state.")
-            return default_state
+            return {}
         raise
 
 def save_state(client, state_data):
-    """Saves the new, combined state to the State Sheet."""
+    """Saves the new state to the State Sheet."""
     logging.info(f"Saving new job number state to State Sheet ID: {STATE_SHEET_ID}")
     state_json = json.dumps(state_data, indent=2)
 
@@ -132,7 +126,7 @@ def save_state(client, state_data):
         raise
 
 def main():
-    """Main execution function with new three-pass logic."""
+    """Main execution function."""
     if not API_TOKEN:
         logging.error("FATAL: SMARTSHEET_API_TOKEN environment variable not set.")
         return
@@ -147,11 +141,9 @@ def main():
             logging.error("Execution halted: No valid sheet configurations were loaded.")
             return
 
-        state = load_state(client)
-        wr_state = state.get('wr_state', {})
-        dept_counters = defaultdict(int, state.get('dept_counters', {}))
+        wr_to_job_map = load_state(client)
 
-        # 2. PASS 1: Fetch ALL rows from ALL sheets into a single list
+        # 2. Fetch ALL rows from ALL sheets into a single list
         logging.info("--- Pass 1: Fetching all data from all configured sheets ---")
         all_rows_to_process = []
         for config_key, config_data in sheet_configs.items():
@@ -170,65 +162,60 @@ def main():
         
         logging.info(f"Total rows fetched across all sheets: {len(all_rows_to_process)}")
 
-        # 3. PASS 2: Calculate final job numbers for each unique Work Request #
-        logging.info("--- Pass 2: Calculating job numbers for unique Work Requests ---")
-        job_assignments_for_this_run = {}
-        unique_wr_nums_processed_this_run = set()
-
-        for item in all_rows_to_process:
-            row = item['row_obj']
-            column_map = item['column_map']
-            cell_map = {cell.column_id: cell for cell in row.cells}
-
-            dept_cell = cell_map.get(column_map['dept'])
-            wr_num_cell = cell_map.get(column_map['wr_num'])
-            
-            dept = dept_cell.display_value if dept_cell and dept_cell.display_value else None
-            wr_num = wr_num_cell.display_value if wr_num_cell and wr_num_cell.display_value else None
-
-            if not dept or not wr_num or wr_num in unique_wr_nums_processed_this_run:
-                continue
-            
-            # This is the first time we are seeing this WR# in this run.
-            # Decide its job number based on historical state.
-            if wr_num not in wr_state:
-                # This is the FIRST time this WR# has ever been seen.
-                dept_counters[dept] += 1
-                base_job_num = f"{dept}-{dept_counters[dept]}"
-                wr_state[wr_num] = {'base_job_num': base_job_num, 'count': 1}
-                job_assignments_for_this_run[wr_num] = base_job_num
-            else:
-                # This is a DUPLICATE WR# from a previous run.
-                wr_state[wr_num]['count'] += 1
-                base_job_num = wr_state[wr_num]['base_job_num']
-                new_job_number = f"{base_job_num}-{wr_state[wr_num]['count']}"
-                job_assignments_for_this_run[wr_num] = new_job_number
-                logging.info(f"Duplicate WR# '{wr_num}' from a previous run found. Original job: '{base_job_num}'. Assigning new job: '{new_job_number}'.")
-
-            unique_wr_nums_processed_this_run.add(wr_num)
-
-        # 4. PASS 3: Prepare batch updates for all rows
-        logging.info("--- Pass 3: Preparing batch updates for all sheets ---")
+        # 3. Calculate job numbers and prepare updates
+        logging.info("--- Pass 2: Calculating job numbers and preparing updates ---")
         updates_by_sheet = defaultdict(list)
+        
+        # Calculate current highest job number for each department from the state
+        dept_counters = defaultdict(int)
+        for job_num in wr_to_job_map.values():
+            try:
+                dept, num = job_num.split('-')
+                dept_counters[dept] = max(dept_counters[dept], int(num))
+            except (ValueError, TypeError):
+                continue # Ignore malformed job numbers in the state
+
+        # Process each row to determine its correct job number
         for item in all_rows_to_process:
             row = item['row_obj']
             sheet_id = item['sheet_id']
             column_map = item['column_map']
             cell_map = {cell.column_id: cell for cell in row.cells}
 
+            dept_cell = cell_map.get(column_map['dept'])
             wr_num_cell = cell_map.get(column_map['wr_num'])
             job_num_cell = cell_map.get(column_map['job_num'])
             
+            dept = dept_cell.display_value if dept_cell and dept_cell.display_value else None
             wr_num = wr_num_cell.display_value if wr_num_cell and wr_num_cell.display_value else None
-            
-            if not wr_num or wr_num not in job_assignments_for_this_run:
-                continue
-
-            # Assign the pre-calculated job number
-            new_job_number = job_assignments_for_this_run[wr_num]
             current_job_number = job_num_cell.display_value if job_num_cell else None
 
-            if new_job_number != current_job_number:
+            if not dept or not wr_num:
+                continue
+
+            new_job_number = None
+            # Logic to handle department changes and new job numbers
+            if wr_num in wr_to_job_map:
+                # This WR has an existing job number. Check if the dept has changed.
+                stored_job_num = wr_to_job_map[wr_num]
+                stored_dept = stored_job_num.split('-')[0]
+                if dept != stored_dept:
+                    # Department has changed! Assign a new job number.
+                    logging.warning(f"Department changed for WR# '{wr_num}' from '{stored_dept}' to '{dept}'. Assigning new job number.")
+                    dept_counters[dept] += 1
+                    new_job_number = f"{dept}-{dept_counters[dept]}"
+                    wr_to_job_map[wr_num] = new_job_number # Update state map
+                else:
+                    # Department is the same, use the existing job number.
+                    new_job_number = stored_job_num
+            else:
+                # This is the FIRST time this WR# has ever been seen. Assign a new job number.
+                dept_counters[dept] += 1
+                new_job_number = f"{dept}-{dept_counters[dept]}"
+                wr_to_job_map[wr_num] = new_job_number # Add to state map
+            
+            # If the calculated job number is different from what's in the sheet, schedule an update.
+            if new_job_number and new_job_number != current_job_number:
                 update_row = smartsheet.models.Row()
                 update_row.id = row.id
                 update_row.cells.append({
@@ -238,7 +225,7 @@ def main():
                 })
                 updates_by_sheet[sheet_id].append(update_row)
 
-        # 5. Perform all batch updates
+        # 4. Perform all batch updates
         logging.info("--- Final Step: Sending all batch updates ---")
         if not updates_by_sheet:
             logging.info("No changes detected across any sheets. Job numbers are up-to-date.")
@@ -248,9 +235,8 @@ def main():
                 client.Sheets.update_rows(sheet_id, rows_to_update)
                 logging.info(f"✅ Batch update successful for sheet {sheet_id}.")
 
-        # 6. Save the final state
-        final_state = {'wr_state': wr_state, 'dept_counters': dict(dept_counters)}
-        save_state(client, final_state)
+        # 5. Save the final state
+        save_state(client, wr_to_job_map)
 
         logging.info("--- 🎉 All Sheets Processed. Process Complete ---")
 
