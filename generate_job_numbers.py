@@ -128,23 +128,13 @@ def main():
 
         logging.info(f"Total rows fetched across both sheets: {len(all_rows)}")
 
-        # Build unique WR# map (favoring first occurrence, i.e., Sheet A before Sheet B)
-        wr_seen = {}
-        duplicate_wrs = set()
+        # Build a map of WR# to all row entries (across both sheets)
+        wr_row_map = defaultdict(list)
         for entry in all_rows:
-            wr_num = entry["wr_num"]
-            if wr_num not in wr_seen:
-                wr_seen[wr_num] = entry
-            else:
-                duplicate_wrs.add(wr_num)
-
-        if duplicate_wrs:
-            for wr in duplicate_wrs:
-                logging.warning(f"Duplicate WR# '{wr}' found in multiple sheets. Will only assign job number to the first occurrence.")
+            wr_row_map[entry["wr_num"]].append(entry)
 
         # Assign job numbers per department (incrementing across both sheets)
         dept_counters = defaultdict(int)
-        # For continuity, initialize counters from state
         for jobnum in wr_to_job_map.values():
             try:
                 dept, num = jobnum.split('-')
@@ -152,32 +142,36 @@ def main():
             except Exception:
                 continue
 
+        # To keep log of duplicates across sheets
+        seen_sheets_per_wr = defaultdict(set)
+        for entry in all_rows:
+            seen_sheets_per_wr[entry["wr_num"]].add(entry["sheet_id"])
+
+        for wr_num, sheets in seen_sheets_per_wr.items():
+            if len(sheets) > 1:
+                logging.warning(f"Duplicate WR# '{wr_num}' found in multiple sheets. Will assign the same job number to all its occurrences.")
+
+        # Assign job numbers and prepare updates
         updates_by_sheet = defaultdict(list)
-        # Assign new job numbers and prepare updates
-        for wr_num, entry in wr_seen.items():
-            # Only assign if not already assigned in state
+        for wr_num, entries in wr_row_map.items():
+            # Assign job number if not already assigned in state
             if wr_num not in wr_to_job_map:
-                dept = entry["dept"]
+                # Use department from first occurrence (could be any, but all should match for a given WR#)
+                dept = entries[0]["dept"]
                 dept_counters[dept] += 1
-                new_job_number = f"{dept}-{dept_counters[dept]}"
-                wr_to_job_map[wr_num] = new_job_number
-                # Prepare update for this row
-                update_row = smartsheet.models.Row()
-                update_row.id = entry["row_id"]
-                update_row.cells.append({
-                    'column_id': entry["columns"]["job_num"],
-                    'value': new_job_number,
-                    'strict': False
-                })
-                updates_by_sheet[entry["sheet_id"]].append(update_row)
+                job_number = f"{dept}-{dept_counters[dept]}"
+                wr_to_job_map[wr_num] = job_number
             else:
-                # Already assigned, but check if sheet value differs from state, update if necessary
-                if entry["job_num"] != wr_to_job_map[wr_num]:
+                job_number = wr_to_job_map[wr_num]
+
+            # Now update all rows for this WR# in both sheets
+            for entry in entries:
+                if entry["job_num"] != job_number:
                     update_row = smartsheet.models.Row()
                     update_row.id = entry["row_id"]
                     update_row.cells.append({
                         'column_id': entry["columns"]["job_num"],
-                        'value': wr_to_job_map[wr_num],
+                        'value': job_number,
                         'strict': False
                     })
                     updates_by_sheet[entry["sheet_id"]].append(update_row)
