@@ -4,70 +4,37 @@ import logging
 import json
 from collections import defaultdict
 
-# --- Configuration ---
-# Set your Smartsheet API token as a secret in your GitHub repository
 API_TOKEN = os.getenv("SMARTSHEET_API_TOKEN")
 
-# --- IDs ---
-# The script is driven by the State Sheet, which defines all other sheets.
-STATE_SHEET_ID = 6534534683119492
+SHEET_CONFIGS = [
+    {
+        "sheet_id": 3239244454645636,
+        "columns": {
+            "dept": 4959096660512644,
+            "wr_num": 3620163004092292,
+            "job_num": 2545575356223364,
+        }
+    },
+    {
+        "sheet_id": 2230129632694148,
+        "columns": {
+            "dept": 5714903412985732,
+            "wr_num": 4026053552721796,
+            "job_num": 3463103599300484,
+        }
+    }
+]
 
-# Column IDs from your STATE sheet ("StateKey" and "StateValue")
+STATE_SHEET_ID = 6534534683119492
 STATE_COLUMN_MAP = {
     'key': 6556595015864196,
     'value': 4304795202178948
 }
-
-# --- Constants ---
-# Key for the row in the state sheet that holds all job counter data.
 STATE_DATA_KEY = "StateData"
-# Prefix for rows in the state sheet that define which sheets to process.
-CONFIG_KEY_PREFIX = "CONFIG_SHEET_"
 
-# --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def load_sheet_mapping(client):
-    """
-    Loads sheet configurations from the State Sheet. Each config's value
-    should be a JSON object with 'sheet_id' and 'column_map'.
-    """
-    logging.info(f"Loading sheet configurations from State Sheet ID: {STATE_SHEET_ID}")
-    sheet_configs = {}
-    try:
-        state_sheet = client.Sheets.get_sheet(STATE_SHEET_ID)
-        for row in state_sheet.rows:
-            key_cell = next((cell for cell in row.cells if cell.column_id == STATE_COLUMN_MAP['key']), None)
-            
-            if key_cell and key_cell.value and key_cell.value.startswith(CONFIG_KEY_PREFIX):
-                value_cell = next((cell for cell in row.cells if cell.column_id == STATE_COLUMN_MAP['value']), None)
-                config_key = key_cell.value
-                
-                if value_cell and value_cell.value:
-                    try:
-                        config_data = json.loads(value_cell.value)
-                        if 'sheet_id' in config_data and 'column_map' in config_data:
-                            sheet_configs[config_key] = config_data
-                            logging.info(f"Loaded configuration for '{config_key}'.")
-                        else:
-                            logging.warning(f"Skipping malformed config for '{config_key}': missing 'sheet_id' or 'column_map'.")
-                    except json.JSONDecodeError:
-                        logging.warning(f"Skipping invalid JSON in config for '{config_key}'.")
-                        
-        if not sheet_configs:
-            logging.warning("No sheet configurations found. Check your State Sheet setup.")
-            
-        return sheet_configs
-    except smartsheet.exceptions.ApiError as e:
-        logging.error(f"Failed to load sheet configurations from State Sheet: {e.error.result}")
-        raise
-
 def load_state(client):
-    """
-    Loads the state from the State Sheet.
-    The state is a simple dictionary mapping a Work Request # to its job number.
-    e.g., {"WR-123": "532-1"}
-    """
     logging.info(f"Loading job number state from State Sheet ID: {STATE_SHEET_ID}")
     try:
         state_sheet = client.Sheets.get_sheet(STATE_SHEET_ID)
@@ -77,14 +44,12 @@ def load_state(client):
                 value_cell = next((cell for cell in row.cells if cell.column_id == STATE_COLUMN_MAP['value']), None)
                 if value_cell and value_cell.value:
                     try:
-                        # Directly return the loaded dictionary
                         state = json.loads(value_cell.value)
                         logging.info(f"Found existing job number state. Loaded {len(state)} records.")
                         return state
                     except (json.JSONDecodeError, TypeError):
                         logging.warning("State data is malformed. Starting fresh.")
                         return {}
-        
         logging.info("No previous job number state found. Starting fresh.")
         return {}
     except smartsheet.exceptions.ApiError as e:
@@ -94,10 +59,8 @@ def load_state(client):
         raise
 
 def save_state(client, state_data):
-    """Saves the new state to the State Sheet."""
     logging.info(f"Saving new job number state to State Sheet ID: {STATE_SHEET_ID}")
     state_json = json.dumps(state_data, indent=2)
-
     try:
         state_sheet = client.Sheets.get_sheet(STATE_SHEET_ID, include=['rows'])
         state_row_id = None
@@ -106,7 +69,6 @@ def save_state(client, state_data):
             if key_cell and key_cell.value == STATE_DATA_KEY:
                 state_row_id = row.id
                 break
-
         if state_row_id:
             logging.info(f"Updating existing state row (ID: {state_row_id})...")
             update_row = smartsheet.models.Row()
@@ -119,14 +81,12 @@ def save_state(client, state_data):
             new_row.cells.append({'column_id': STATE_COLUMN_MAP['key'], 'value': STATE_DATA_KEY})
             new_row.cells.append({'column_id': STATE_COLUMN_MAP['value'], 'value': state_json})
             client.Sheets.add_rows(STATE_SHEET_ID, [new_row])
-        
         logging.info("Successfully saved state.")
     except Exception as e:
         logging.error(f"Failed to save state: {e}")
         raise
 
 def main():
-    """Main execution function."""
     if not API_TOKEN:
         logging.error("FATAL: SMARTSHEET_API_TOKEN environment variable not set.")
         return
@@ -135,113 +95,104 @@ def main():
     client.errors_as_exceptions(True)
 
     try:
-        # 1. Load configurations and the historical state
-        sheet_configs = load_sheet_mapping(client)
-        if not sheet_configs:
-            logging.error("Execution halted: No valid sheet configurations were loaded.")
-            return
-
+        # Load state
         wr_to_job_map = load_state(client)
 
-        # 2. Fetch ALL rows from ALL sheets into a single list
-        logging.info("--- Pass 1: Fetching all data from all configured sheets ---")
-        all_rows_to_process = []
-        for config_key, config_data in sheet_configs.items():
-            sheet_id = config_data['sheet_id']
-            logging.info(f"Fetching rows from sheet '{config_key}' (ID: {sheet_id})")
+        # Gather all rows from both sheets
+        all_rows = []
+        for sheet_cfg in SHEET_CONFIGS:
+            sheet_id = sheet_cfg["sheet_id"]
+            columns = sheet_cfg["columns"]
+            logging.info(f"Fetching rows from sheet ID: {sheet_id}")
             try:
-                source_sheet = client.Sheets.get_sheet(sheet_id, include=['objectValue'])
-                for row in source_sheet.rows:
-                    all_rows_to_process.append({
-                        'row_obj': row,
-                        'sheet_id': sheet_id,
-                        'column_map': config_data['column_map']
-                    })
+                sheet = client.Sheets.get_sheet(sheet_id)
+                for row in sheet.rows:
+                    cell_map = {cell.column_id: cell for cell in row.cells}
+                    dept_cell = cell_map.get(columns["dept"])
+                    wr_num_cell = cell_map.get(columns["wr_num"])
+                    job_num_cell = cell_map.get(columns["job_num"])
+                    dept = dept_cell.display_value if dept_cell and dept_cell.display_value else None
+                    wr_num = wr_num_cell.display_value if wr_num_cell and wr_num_cell.display_value else None
+                    job_num = job_num_cell.display_value if job_num_cell else None
+                    if dept and wr_num:
+                        all_rows.append({
+                            "sheet_id": sheet_id,
+                            "row_id": row.id,
+                            "columns": columns,
+                            "dept": dept,
+                            "wr_num": wr_num,
+                            "job_num": job_num,
+                        })
             except smartsheet.exceptions.ApiError as e:
                 logging.error(f"Could not access sheet ID {sheet_id}. Skipping. Error: {e.error.result}")
-        
-        logging.info(f"Total rows fetched across all sheets: {len(all_rows_to_process)}")
 
-        # 3. Calculate job numbers and prepare updates
-        logging.info("--- Pass 2: Calculating job numbers and preparing updates ---")
-        updates_by_sheet = defaultdict(list)
-        
-        # Calculate current highest job number for each department from the state
+        logging.info(f"Total rows fetched across both sheets: {len(all_rows)}")
+
+        # Build unique WR# map (favoring first occurrence, i.e., Sheet A before Sheet B)
+        wr_seen = {}
+        duplicate_wrs = set()
+        for entry in all_rows:
+            wr_num = entry["wr_num"]
+            if wr_num not in wr_seen:
+                wr_seen[wr_num] = entry
+            else:
+                duplicate_wrs.add(wr_num)
+
+        if duplicate_wrs:
+            for wr in duplicate_wrs:
+                logging.warning(f"Duplicate WR# '{wr}' found in multiple sheets. Will only assign job number to the first occurrence.")
+
+        # Assign job numbers per department (incrementing across both sheets)
         dept_counters = defaultdict(int)
-        for job_num in wr_to_job_map.values():
+        # For continuity, initialize counters from state
+        for jobnum in wr_to_job_map.values():
             try:
-                dept, num = job_num.split('-')
+                dept, num = jobnum.split('-')
                 dept_counters[dept] = max(dept_counters[dept], int(num))
-            except (ValueError, TypeError):
-                continue # Ignore malformed job numbers in the state
-
-        # Process each row to determine its correct job number
-        for item in all_rows_to_process:
-            row = item['row_obj']
-            sheet_id = item['sheet_id']
-            column_map = item['column_map']
-            cell_map = {cell.column_id: cell for cell in row.cells}
-
-            dept_cell = cell_map.get(column_map['dept'])
-            wr_num_cell = cell_map.get(column_map['wr_num'])
-            job_num_cell = cell_map.get(column_map['job_num'])
-            
-            dept = dept_cell.display_value if dept_cell and dept_cell.display_value else None
-            wr_num = wr_num_cell.display_value if wr_num_cell and wr_num_cell.display_value else None
-            current_job_number = job_num_cell.display_value if job_num_cell else None
-
-            if not dept or not wr_num:
+            except Exception:
                 continue
 
-            new_job_number = None
-            # Logic to handle department changes and new job numbers
-            if wr_num in wr_to_job_map:
-                # This WR has an existing job number. Check if the dept has changed.
-                stored_job_num = wr_to_job_map[wr_num]
-                stored_dept = stored_job_num.split('-')[0]
-                if dept != stored_dept:
-                    # Department has changed! Assign a new job number.
-                    logging.warning(f"Department changed for WR# '{wr_num}' from '{stored_dept}' to '{dept}'. Assigning new job number.")
-                    dept_counters[dept] += 1
-                    new_job_number = f"{dept}-{dept_counters[dept]}"
-                    wr_to_job_map[wr_num] = new_job_number # Update state map
-                else:
-                    # Department is the same, use the existing job number.
-                    new_job_number = stored_job_num
-            else:
-                # This is the FIRST time this WR# has ever been seen. Assign a new job number.
+        updates_by_sheet = defaultdict(list)
+        # Assign new job numbers and prepare updates
+        for wr_num, entry in wr_seen.items():
+            # Only assign if not already assigned in state
+            if wr_num not in wr_to_job_map:
+                dept = entry["dept"]
                 dept_counters[dept] += 1
                 new_job_number = f"{dept}-{dept_counters[dept]}"
-                wr_to_job_map[wr_num] = new_job_number # Add to state map
-            
-            # If the calculated job number is different from what's in the sheet, schedule an update.
-            if new_job_number and new_job_number != current_job_number:
+                wr_to_job_map[wr_num] = new_job_number
+                # Prepare update for this row
                 update_row = smartsheet.models.Row()
-                update_row.id = row.id
+                update_row.id = entry["row_id"]
                 update_row.cells.append({
-                    'column_id': column_map['job_num'],
+                    'column_id': entry["columns"]["job_num"],
                     'value': new_job_number,
                     'strict': False
                 })
-                updates_by_sheet[sheet_id].append(update_row)
+                updates_by_sheet[entry["sheet_id"]].append(update_row)
+            else:
+                # Already assigned, but check if sheet value differs from state, update if necessary
+                if entry["job_num"] != wr_to_job_map[wr_num]:
+                    update_row = smartsheet.models.Row()
+                    update_row.id = entry["row_id"]
+                    update_row.cells.append({
+                        'column_id': entry["columns"]["job_num"],
+                        'value': wr_to_job_map[wr_num],
+                        'strict': False
+                    })
+                    updates_by_sheet[entry["sheet_id"]].append(update_row)
 
-        # 4. Perform all batch updates
-        logging.info("--- Final Step: Sending all batch updates ---")
-        if not updates_by_sheet:
-            logging.info("No changes detected across any sheets. Job numbers are up-to-date.")
-        else:
-            for sheet_id, rows_to_update in updates_by_sheet.items():
-                logging.info(f"Found {len(rows_to_update)} rows to update in sheet {sheet_id}. Sending batch update...")
-                client.Sheets.update_rows(sheet_id, rows_to_update)
-                logging.info(f"✅ Batch update successful for sheet {sheet_id}.")
+        # Send updates
+        for sheet_id, rows in updates_by_sheet.items():
+            if rows:
+                logging.info(f"Updating {len(rows)} rows on sheet {sheet_id}")
+                client.Sheets.update_rows(sheet_id, rows)
+                logging.info(f"✅ Updated rows on sheet {sheet_id}")
 
-        # 5. Save the final state
+        # Save new job number state
         save_state(client, wr_to_job_map)
+        logging.info("Process complete.")
 
-        logging.info("--- 🎉 All Sheets Processed. Process Complete ---")
-
-    except smartsheet.exceptions.ApiError as e:
-        logging.error(f"A Smartsheet API Error occurred: {e.error.result}")
     except Exception as e:
         logging.error(f"An unexpected error occurred: {e}", exc_info=True)
 
