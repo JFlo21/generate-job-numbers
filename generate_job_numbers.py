@@ -11,16 +11,19 @@ Key Features:
 - Maintains state between runs to ensure consistent job numbering
 - Automatically detects existing job number format from current data
 - Preserves the naming convention used in original sheets
+- Supports optional helper columns (Helper Dept # and Helper Job [#])
 
 Required Environment Variables:
 - SMARTSHEET_API_TOKEN: Your Smartsheet API token
 
 Required Sheet Structure:
-- Sheets must contain columns named: dept, wr_num, job_num
+- Sheets must contain columns named: Dept #, Work Request #, Job #
+- Optional: Helper Dept #, Helper Job [#] (both must be present for helper functionality)
 - State sheet for persistence (STATE_SHEET_ID)
 
 The script will analyze existing job numbers in discovered sheets to determine the
-correct naming convention and apply it to new job number assignments.
+correct naming convention and apply it to new job number assignments. If helper columns
+are present, it will also populate Helper Job [#] based on Helper Dept #.
 """
 
 import os
@@ -34,6 +37,9 @@ API_TOKEN = os.getenv("SMARTSHEET_API_TOKEN")
 # Required column names for sheets to be processed
 # You can modify these if your sheets use different column names
 REQUIRED_COLUMNS = ["Dept #", "Work Request #", "Job #"]
+
+# Optional helper columns - if present, will also populate Helper Job [#] based on Helper Dept #
+OPTIONAL_HELPER_COLUMNS = ["Helper Dept #", "Helper Job [#]"]
 
 # Optional: Set to True to enable debug logging for sheet discovery
 DEBUG_SHEET_DISCOVERY = False
@@ -124,20 +130,35 @@ def discover_target_sheets(client):
                     else:
                         missing_columns.append(req_col)
                 
+                # Check for optional helper columns
+                helper_columns_found = {}
+                for helper_col in OPTIONAL_HELPER_COLUMNS:
+                    if helper_col.lower() in column_map:
+                        if helper_col == "Helper Dept #":
+                            helper_columns_found["helper_dept"] = column_map[helper_col.lower()]
+                        elif helper_col == "Helper Job [#]":
+                            helper_columns_found["helper_job_num"] = column_map[helper_col.lower()]
+                
                 if not missing_columns:
                     # All required columns found - add this sheet to our config
+                    # Merge required and optional columns
+                    all_columns = {**required_columns_found, **helper_columns_found}
+                    
                     sheet_config = {
                         "sheet_id": sheet_id,
                         "sheet_name": sheet_name,
-                        "columns": required_columns_found
+                        "columns": all_columns,
+                        "has_helper_columns": len(helper_columns_found) == 2  # Both helper columns must be present
                     }
                     discovered_sheets.append(sheet_config)
                     
                     # Note if this was one of the original hardcoded sheets
                     if sheet_id in ORIGINAL_SHEET_IDS:
-                        logging.info(f"✅ Found qualifying sheet: {sheet_name} (ID: {sheet_id}) [ORIGINAL]")
+                        helper_status = " (with helper columns)" if sheet_config["has_helper_columns"] else ""
+                        logging.info(f"✅ Found qualifying sheet: {sheet_name} (ID: {sheet_id}) [ORIGINAL]{helper_status}")
                     else:
-                        logging.info(f"✅ Found qualifying sheet: {sheet_name} (ID: {sheet_id}) [NEW]")
+                        helper_status = " (with helper columns)" if sheet_config["has_helper_columns"] else ""
+                        logging.info(f"✅ Found qualifying sheet: {sheet_name} (ID: {sheet_id}) [NEW]{helper_status}")
                 else:
                     if DEBUG_SHEET_DISCOVERY:
                         logging.debug(f"⏭️  Skipping sheet '{sheet_name}' - missing columns: {missing_columns}")
@@ -398,6 +419,7 @@ def main():
         for sheet_cfg in sheet_configs:
             sheet_id = sheet_cfg["sheet_id"]
             columns = sheet_cfg["columns"]
+            has_helper = sheet_cfg["has_helper_columns"]
             logging.info(f"Fetching rows from sheet ID: {sheet_id}")
             try:
                 sheet = client.Sheets.get_sheet(sheet_id)
@@ -410,15 +432,27 @@ def main():
                     wr_num = wr_num_cell.display_value if wr_num_cell and wr_num_cell.display_value else None
                     job_num = job_num_cell.display_value if job_num_cell else None
                     
+                    # Read helper columns if present
+                    helper_dept = None
+                    helper_job_num = None
+                    if has_helper:
+                        helper_dept_cell = cell_map.get(columns.get("helper_dept"))
+                        helper_job_num_cell = cell_map.get(columns.get("helper_job_num"))
+                        helper_dept = helper_dept_cell.display_value if helper_dept_cell and helper_dept_cell.display_value else None
+                        helper_job_num = helper_job_num_cell.display_value if helper_job_num_cell else None
+                    
                     # Filter out rows with excluded patterns in dept or wr_num
                     if dept and wr_num and not should_exclude_value(dept) and not should_exclude_value(wr_num):
                         all_rows.append({
                             "sheet_id": sheet_id,
                             "row_id": row.id,
                             "columns": columns,
+                            "has_helper": has_helper,
                             "dept": dept,
                             "wr_num": wr_num,
                             "job_num": job_num,  # Keep original for comparison
+                            "helper_dept": helper_dept,
+                            "helper_job_num": helper_job_num,
                         })
                     elif dept and wr_num:
                         # Log excluded entries
@@ -487,21 +521,63 @@ def main():
                 needs_update = (current_job_num != job_number or 
                               should_exclude_value(current_job_num))
                 
-                if needs_update:
+                # For helper columns, generate helper job number based on Helper Dept #
+                helper_job_number = None
+                helper_needs_update = False
+                if entry["has_helper"] and entry["helper_dept"] and not should_exclude_value(entry["helper_dept"]):
+                    # Generate helper job number using the helper department
+                    helper_dept = entry["helper_dept"]
+                    # Use the same counter system but for helper dept
+                    if helper_dept not in dept_counters:
+                        dept_counters[helper_dept] = 0
+                    # Check if we need to generate a new helper job number
+                    # We'll use the same WR# but generate based on helper_dept
+                    helper_key = f"helper_{wr_num}_{helper_dept}"
+                    if helper_key not in wr_to_job_map:
+                        dept_counters[helper_dept] += 1
+                        helper_job_number = job_number_formatter(helper_dept, dept_counters[helper_dept])
+                        wr_to_job_map[helper_key] = helper_job_number
+                        logging.info(f"Assigned new helper job number: {helper_job_number} for WR# {wr_num} (Helper Dept: {helper_dept})")
+                    else:
+                        helper_job_number = wr_to_job_map[helper_key]
+                    
+                    current_helper_job_num = entry["helper_job_num"]
+                    helper_needs_update = (current_helper_job_num != helper_job_number or 
+                                          should_exclude_value(current_helper_job_num))
+                
+                if needs_update or helper_needs_update:
                     update_row = smartsheet.models.Row()
                     update_row.id = entry["row_id"]
-                    update_row.cells.append({
-                        'column_id': entry["columns"]["job_num"],
-                        'value': job_number,
-                        'strict': False
-                    })
-                    updates_by_sheet[entry["sheet_id"]].append(update_row)
                     
-                    # Log the update reason
-                    if should_exclude_value(current_job_num):
-                        logging.info(f"Replacing excluded value '{current_job_num}' with '{job_number}' for WR# {wr_num}")
-                    else:
-                        logging.debug(f"Updating job number from '{current_job_num}' to '{job_number}' for WR# {wr_num}")
+                    # Update main Job # column if needed
+                    if needs_update:
+                        update_row.cells.append({
+                            'column_id': entry["columns"]["job_num"],
+                            'value': job_number,
+                            'strict': False
+                        })
+                        
+                        # Log the update reason
+                        if should_exclude_value(current_job_num):
+                            logging.info(f"Replacing excluded value '{current_job_num}' with '{job_number}' for WR# {wr_num}")
+                        else:
+                            logging.debug(f"Updating job number from '{current_job_num}' to '{job_number}' for WR# {wr_num}")
+                    
+                    # Update Helper Job [#] column if needed
+                    if helper_needs_update and helper_job_number:
+                        update_row.cells.append({
+                            'column_id': entry["columns"]["helper_job_num"],
+                            'value': helper_job_number,
+                            'strict': False
+                        })
+                        
+                        # Log the helper update reason
+                        if should_exclude_value(entry["helper_job_num"]):
+                            logging.info(f"Replacing excluded helper value '{entry['helper_job_num']}' with '{helper_job_number}' for WR# {wr_num}")
+                        else:
+                            logging.debug(f"Updating helper job number from '{entry['helper_job_num']}' to '{helper_job_number}' for WR# {wr_num}")
+                    
+                    updates_by_sheet[entry["sheet_id"]].append(update_row)
 
         # Send updates
         for sheet_id, rows in updates_by_sheet.items():
