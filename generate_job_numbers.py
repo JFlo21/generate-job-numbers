@@ -436,8 +436,8 @@ def main():
                     helper_dept = None
                     helper_job_num = None
                     if has_helper:
-                        helper_dept_cell = cell_map.get(columns.get("helper_dept"))
-                        helper_job_num_cell = cell_map.get(columns.get("helper_job_num"))
+                        helper_dept_cell = cell_map.get(columns["helper_dept"])
+                        helper_job_num_cell = cell_map.get(columns["helper_job_num"])
                         helper_dept = helper_dept_cell.display_value if helper_dept_cell and helper_dept_cell.display_value else None
                         helper_job_num = helper_job_num_cell.display_value if helper_job_num_cell else None
                     
