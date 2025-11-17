@@ -13,6 +13,7 @@ Key Features:
 - Preserves the naming convention used in original sheets
 - Supports optional helper columns (Helper Dept # and Helper Job [#])
 - Uses separate state tracking for main and helper job numbers
+- Shared counters for department numbers (main and helper share the same sequence)
 
 Required Environment Variables:
 - SMARTSHEET_API_TOKEN: Your Smartsheet API token
@@ -27,7 +28,8 @@ Required Sheet Structure:
 The script will analyze existing job numbers in discovered sheets to determine the
 correct naming convention and apply it to new job number assignments. If helper columns
 are present, it will also populate Helper Job [#] based on Helper Dept # using the same
-format but with independent counters to avoid conflicts.
+format and shared counters (if a helper dept # matches a main dept #, they increment
+the same counter sequence).
 """
 
 import os
@@ -535,8 +537,8 @@ def main():
             wr_row_map[entry["wr_num"]].append(entry)
 
         # Assign job numbers per department using detected format
+        # Use shared counters for both main and helper departments
         dept_counters = defaultdict(int)
-        helper_dept_counters = defaultdict(int)  # Separate counters for helper departments
         
         # Parse existing job numbers to get current counters for each department
         for jobnum in wr_to_job_map.values():
@@ -557,7 +559,7 @@ def main():
                 # Skip malformed job numbers
                 continue
         
-        # Parse existing helper job numbers to get current counters for each helper department
+        # Parse existing helper job numbers to update the same shared counters
         for helper_jobnum in helper_wr_to_job_map.values():
             try:
                 # Try to extract department and number from existing helper job numbers
@@ -567,11 +569,11 @@ def main():
                         # Last part is the number, second-to-last might be dept
                         dept = parts[-2] if len(parts) > 1 else parts[0]
                         num = int(parts[-1])
-                        helper_dept_counters[dept] = max(helper_dept_counters[dept], num)
+                        dept_counters[dept] = max(dept_counters[dept], num)
                     elif len(parts) == 2 and parts[1].isdigit():
                         # Simple DEPT-NUM format
                         dept, num = parts[0], int(parts[1])
-                        helper_dept_counters[dept] = max(helper_dept_counters[dept], num)
+                        dept_counters[dept] = max(dept_counters[dept], num)
             except (ValueError, IndexError):
                 # Skip malformed helper job numbers
                 continue
@@ -611,14 +613,15 @@ def main():
                 if entry["has_helper"] and entry["helper_dept"] and not should_exclude_value(entry["helper_dept"]):
                     # Generate helper job number using the helper department
                     helper_dept = entry["helper_dept"]
-                    # Use separate counter system for helper departments
+                    # Use shared counter system with main departments
+                    # If helper dept matches a main dept, they share the same counter sequence
                     # Create a key based on WR# and helper department
                     helper_key = f"{wr_num}_{helper_dept}"
                     
                     # Check if we need to generate a new helper job number
                     if helper_key not in helper_wr_to_job_map:
-                        helper_dept_counters[helper_dept] += 1
-                        helper_job_number = job_number_formatter(helper_dept, helper_dept_counters[helper_dept])
+                        dept_counters[helper_dept] += 1
+                        helper_job_number = job_number_formatter(helper_dept, dept_counters[helper_dept])
                         helper_wr_to_job_map[helper_key] = helper_job_number
                         logging.info(f"Assigned new helper job number: {helper_job_number} for WR# {wr_num} (Helper Dept: {helper_dept})")
                     else:
