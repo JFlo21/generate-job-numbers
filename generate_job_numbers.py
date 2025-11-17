@@ -12,6 +12,7 @@ Key Features:
 - Automatically detects existing job number format from current data
 - Preserves the naming convention used in original sheets
 - Supports optional helper columns (Helper Dept # and Helper Job [#])
+- Uses separate state tracking for main and helper job numbers
 
 Required Environment Variables:
 - SMARTSHEET_API_TOKEN: Your Smartsheet API token
@@ -19,11 +20,14 @@ Required Environment Variables:
 Required Sheet Structure:
 - Sheets must contain columns named: Dept #, Work Request #, Job #
 - Optional: Helper Dept #, Helper Job [#] (both must be present for helper functionality)
-- State sheet for persistence (STATE_SHEET_ID)
+- State sheet for persistence (STATE_SHEET_ID) with two rows:
+  - "StateData" row for main job number mappings
+  - "HelperStateData" row for helper job number mappings
 
 The script will analyze existing job numbers in discovered sheets to determine the
 correct naming convention and apply it to new job number assignments. If helper columns
-are present, it will also populate Helper Job [#] based on Helper Dept #.
+are present, it will also populate Helper Job [#] based on Helper Dept # using the same
+format but with independent counters to avoid conflicts.
 """
 
 import os
@@ -55,6 +59,7 @@ STATE_COLUMN_NAMES = {
     'value': 'value'     # Column name that stores the JSON data
 }
 STATE_DATA_KEY = "StateData"
+HELPER_STATE_DATA_KEY = "HelperStateData"  # Separate key for helper job number state
 
 # Patterns to exclude from processing (case-insensitive)
 EXCLUDE_PATTERNS = ["no match", "no match - 004", "not assigned"]
@@ -357,6 +362,33 @@ def load_state(client):
             return {}
         raise
 
+def load_helper_state(client):
+    logging.info(f"Loading helper job number state from State Sheet ID: {STATE_SHEET_ID}")
+    try:
+        # Dynamically discover state sheet column IDs
+        state_column_map = get_state_sheet_columns(client)
+        
+        state_sheet = client.Sheets.get_sheet(STATE_SHEET_ID)
+        for row in state_sheet.rows:
+            key_cell = next((cell for cell in row.cells if cell.column_id == state_column_map['key']), None)
+            if key_cell and key_cell.value == HELPER_STATE_DATA_KEY:
+                value_cell = next((cell for cell in row.cells if cell.column_id == state_column_map['value']), None)
+                if value_cell and value_cell.value:
+                    try:
+                        state = json.loads(value_cell.value)
+                        logging.info(f"Found existing helper job number state. Loaded {len(state)} records.")
+                        return state
+                    except (json.JSONDecodeError, TypeError):
+                        logging.warning("Helper state data is malformed. Starting fresh.")
+                        return {}
+        logging.info("No previous helper job number state found. Starting fresh.")
+        return {}
+    except smartsheet.exceptions.ApiError as e:
+        if e.error.result.error_code == 1006:
+            logging.warning("State Sheet not found. Cannot load helper state.")
+            return {}
+        raise
+
 def save_state(client, state_data):
     logging.info(f"Saving new job number state to State Sheet ID: {STATE_SHEET_ID}")
     state_json = json.dumps(state_data, indent=2)
@@ -388,6 +420,37 @@ def save_state(client, state_data):
         logging.error(f"Failed to save state: {e}")
         raise
 
+def save_helper_state(client, helper_state_data):
+    logging.info(f"Saving new helper job number state to State Sheet ID: {STATE_SHEET_ID}")
+    state_json = json.dumps(helper_state_data, indent=2)
+    try:
+        # Dynamically discover state sheet column IDs
+        state_column_map = get_state_sheet_columns(client)
+        
+        state_sheet = client.Sheets.get_sheet(STATE_SHEET_ID, include=['rows'])
+        state_row_id = None
+        for row in state_sheet.rows:
+            key_cell = next((cell for cell in row.cells if cell.column_id == state_column_map['key']), None)
+            if key_cell and key_cell.value == HELPER_STATE_DATA_KEY:
+                state_row_id = row.id
+                break
+        if state_row_id:
+            logging.info(f"Updating existing helper state row (ID: {state_row_id})...")
+            update_row = smartsheet.models.Row()
+            update_row.id = state_row_id
+            update_row.cells.append({'column_id': state_column_map['value'], 'value': state_json})
+            client.Sheets.update_rows(STATE_SHEET_ID, [update_row])
+        else:
+            logging.info("Helper state row not found. Creating a new one...")
+            new_row = smartsheet.models.Row()
+            new_row.cells.append({'column_id': state_column_map['key'], 'value': HELPER_STATE_DATA_KEY})
+            new_row.cells.append({'column_id': state_column_map['value'], 'value': state_json})
+            client.Sheets.add_rows(STATE_SHEET_ID, [new_row])
+        logging.info("Successfully saved helper state.")
+    except Exception as e:
+        logging.error(f"Failed to save helper state: {e}")
+        raise
+
 def main():
     if not API_TOKEN:
         logging.error("FATAL: SMARTSHEET_API_TOKEN environment variable not set.")
@@ -399,8 +462,9 @@ def main():
     client.errors_as_exceptions(True)
 
     try:
-        # Load state
+        # Load state for main job numbers and helper job numbers separately
         wr_to_job_map = load_state(client)
+        helper_wr_to_job_map = load_helper_state(client)
 
         # Discover sheets that need job number processing
         sheet_configs = discover_target_sheets(client)
@@ -472,6 +536,7 @@ def main():
 
         # Assign job numbers per department using detected format
         dept_counters = defaultdict(int)
+        helper_dept_counters = defaultdict(int)  # Separate counters for helper departments
         
         # Parse existing job numbers to get current counters for each department
         for jobnum in wr_to_job_map.values():
@@ -490,6 +555,25 @@ def main():
                         dept_counters[dept] = max(dept_counters[dept], num)
             except (ValueError, IndexError):
                 # Skip malformed job numbers
+                continue
+        
+        # Parse existing helper job numbers to get current counters for each helper department
+        for helper_jobnum in helper_wr_to_job_map.values():
+            try:
+                # Try to extract department and number from existing helper job numbers
+                if '-' in helper_jobnum:
+                    parts = helper_jobnum.split('-')
+                    if len(parts) >= 2 and parts[-1].isdigit():
+                        # Last part is the number, second-to-last might be dept
+                        dept = parts[-2] if len(parts) > 1 else parts[0]
+                        num = int(parts[-1])
+                        helper_dept_counters[dept] = max(helper_dept_counters[dept], num)
+                    elif len(parts) == 2 and parts[1].isdigit():
+                        # Simple DEPT-NUM format
+                        dept, num = parts[0], int(parts[1])
+                        helper_dept_counters[dept] = max(helper_dept_counters[dept], num)
+            except (ValueError, IndexError):
+                # Skip malformed helper job numbers
                 continue
 
         # To keep log of duplicates across sheets
@@ -527,19 +611,18 @@ def main():
                 if entry["has_helper"] and entry["helper_dept"] and not should_exclude_value(entry["helper_dept"]):
                     # Generate helper job number using the helper department
                     helper_dept = entry["helper_dept"]
-                    # Use the same counter system but for helper dept
-                    if helper_dept not in dept_counters:
-                        dept_counters[helper_dept] = 0
+                    # Use separate counter system for helper departments
+                    # Create a key based on WR# and helper department
+                    helper_key = f"{wr_num}_{helper_dept}"
+                    
                     # Check if we need to generate a new helper job number
-                    # We'll use the same WR# but generate based on helper_dept
-                    helper_key = f"helper_{wr_num}_{helper_dept}"
-                    if helper_key not in wr_to_job_map:
-                        dept_counters[helper_dept] += 1
-                        helper_job_number = job_number_formatter(helper_dept, dept_counters[helper_dept])
-                        wr_to_job_map[helper_key] = helper_job_number
+                    if helper_key not in helper_wr_to_job_map:
+                        helper_dept_counters[helper_dept] += 1
+                        helper_job_number = job_number_formatter(helper_dept, helper_dept_counters[helper_dept])
+                        helper_wr_to_job_map[helper_key] = helper_job_number
                         logging.info(f"Assigned new helper job number: {helper_job_number} for WR# {wr_num} (Helper Dept: {helper_dept})")
                     else:
-                        helper_job_number = wr_to_job_map[helper_key]
+                        helper_job_number = helper_wr_to_job_map[helper_key]
                     
                     current_helper_job_num = entry["helper_job_num"]
                     helper_needs_update = (current_helper_job_num != helper_job_number or 
@@ -586,8 +669,9 @@ def main():
                 client.Sheets.update_rows(sheet_id, rows)
                 logging.info(f"✅ Updated rows on sheet {sheet_id}")
 
-        # Save new job number state
+        # Save new job number state (main and helper separately)
         save_state(client, wr_to_job_map)
+        save_helper_state(client, helper_wr_to_job_map)
         logging.info("Process complete.")
 
     except Exception as e:
