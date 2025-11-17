@@ -148,7 +148,7 @@ def discover_target_sheets(client):
                         "sheet_id": sheet_id,
                         "sheet_name": sheet_name,
                         "columns": all_columns,
-                        "has_helper_columns": len(helper_columns_found) == 2  # Both helper columns must be present
+                        "has_helper_columns": ("helper_dept" in helper_columns_found and "helper_job_num" in helper_columns_found)  # Both helper columns must be present
                     }
                     discovered_sheets.append(sheet_config)
                     
