@@ -1,0 +1,47 @@
+{
+  "sheets": {
+    "249276132183940": {
+      "sheet_id": 249276132183940,
+      "name": "Intake Promax 2",
+      "columns": {
+        "dept": 2098095673003908,
+        "work_request": 1957358184648580,
+        "job": 6601695300374404,
+        "helper_dept": 2520308138069892,
+        "helper_job": 7023907765440388
+      },
+      "has_helper_columns": true,
+      "last_verified": "2025-11-18T22:16:30.897382",
+      "row_count": 469
+    },
+    "58939002539908": {
+      "sheet_id": 58939002539908,
+      "name": "Resiliency Promax Database Backup 12",
+      "columns": {
+        "dept": 1807893972864900,
+        "work_request": 6030018623524740,
+        "job": 6311493600235396,
+        "helper_dept": null,
+        "helper_job": null
+      },
+      "has_helper_columns": false,
+      "last_verified": "2025-11-18T22:16:31.337026",
+      "row_count": 4
+    },
+    "5291853336235908": {
+      "sheet_id": 5291853336235908,
+      "name": "Resiliency Promax Database Backup 11",
+      "columns": {
+        "dept": 4254651813416836,
+        "work_request": 8054563999010692,
+        "job": 8758251440787332,
+        "helper_dept": 2262279907921796,
+        "helper_job": 1106890755624836
+      },
+      "has_helper_columns": true,
+      "last_verified": "2025-11-18T22:17:10.095902",
+      "row_count": 2000
+    }
+  },
+  "last_updated": "2025-11-18T22:17:10.095970"
+}

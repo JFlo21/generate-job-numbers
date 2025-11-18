@@ -1,763 +1,719 @@
+#!/usr/bin/env python3
 """
-Dynamic Job Number Generator for Smartsheet - Optimized Version
-
-Performance optimizations:
-- Parallel sheet processing with ThreadPoolExecutor
-- Cached sheet metadata to avoid redundant API calls
-- Selective column fetching to reduce payload size
-- Batch processing with rate limiting
-- Progress indicators and timing instrumentation
-- State sheet caching
-
-Key improvements from original:
-- Reduced from 2+ hours to ~15-20 minutes runtime
-- Single sheet fetch per discovery instead of double-fetching
-- Parallel processing of up to 6 sheets simultaneously
-- Respects Smartsheet API rate limits (300 req/min)
+Optimized Smartsheet Job Number Generator with Caching and Parallel Processing
+Processes Resiliency Promax Database and Intake Promax sheets
 """
 
-import os
 import smartsheet
 import logging
-import json
 import time
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock, Semaphore
+import json
+import os
 from datetime import datetime, timedelta
-import sys
+from threading import Semaphore, Lock, RLock
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, List, Set, Optional, Tuple
+from dataclasses import dataclass, asdict
+import random
+from collections import deque
 
-API_TOKEN = os.getenv("SMARTSHEET_API_TOKEN")
-
-# Required column names for sheets to be processed
-REQUIRED_COLUMNS = ["Dept #", "Work Request #", "Job #"]
-OPTIONAL_HELPER_COLUMNS = ["Helper Dept #", "Helper Job [#]"]
-
-# Performance tuning parameters
-MAX_WORKERS = 6  # Number of parallel threads for sheet processing
-RATE_LIMIT_REQUESTS = 300  # Smartsheet allows 300 requests per minute
-RATE_LIMIT_WINDOW = 60  # seconds
-BATCH_SIZE = 500  # Process updates in batches
-PROGRESS_UPDATE_INTERVAL = 10  # Update progress every N sheets
-
-# Optional: Set to True to enable debug logging for sheet discovery
-DEBUG_SHEET_DISCOVERY = False
-
-# Original hardcoded sheet IDs for reference
-ORIGINAL_SHEET_IDS = [3239244454645636, 2230129632694148, 1732945426468740, 4126460034895748]
-
-STATE_SHEET_ID = 6534534683119492
-STATE_COLUMN_NAMES = {
-    'key': 'key',
-    'value': 'value'
-}
-STATE_DATA_KEY = "StateData"
-HELPER_STATE_DATA_KEY = "HelperStateData"
-
-# Patterns to exclude from processing
-EXCLUDE_PATTERNS = ["no match", "no match - 004", "not assigned"]
-
-# Configure logging with more detailed format
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - [%(levelname)s] - %(message)s',
     handlers=[
-        logging.StreamHandler(sys.stdout)
+        logging.StreamHandler(),
+        logging.FileHandler('job_generator_optimized.log')
     ]
 )
 
-# Global rate limiter
-class RateLimiter:
-    def __init__(self, max_requests=RATE_LIMIT_REQUESTS, window=RATE_LIMIT_WINDOW):
-        self.semaphore = Semaphore(max_requests)
+# Configuration
+API_TOKEN = os.getenv("SMARTSHEET_API_TOKEN")
+if not API_TOKEN:
+    raise ValueError("Please set SMARTSHEET_API_TOKEN environment variable")
+
+# Target workspace and folders
+TARGET_WORKSPACE_ID = 2763941144225668  # Linetec - Resiliency
+TARGET_FOLDER_IDS = [
+    1257051776149380,  # Parent folder
+    7644752003786628   # Subfolder containing the sheets
+]
+
+# Sheet name patterns to process
+SHEET_NAME_PATTERNS = [
+    "resiliency promax database",
+    "intake promax",
+]
+
+# State tracking sheet
+STATE_SHEET_ID = 6534534683119492
+STATE_COLUMN_NAMES = {
+    'key': 'key',
+    'generated_number': 'generated number'
+}
+
+# Cache configuration
+CACHE_FILE = "sheet_discovery_cache.json"
+CACHE_EXPIRY_DAYS = 7  # Re-verify sheets after 7 days
+
+# Performance settings
+MAX_WORKERS = 5  # Number of parallel workers
+BATCH_SIZE = 500  # Rows to update in single API call
+RATE_LIMIT_REQUESTS = 300  # Smartsheet limit
+RATE_LIMIT_WINDOW = 60  # seconds
+BURST_CAPACITY = 50  # Allow burst of requests
+
+# Patterns to exclude
+EXCLUDE_PATTERNS = ['#', '-', '(', ')', '"', '_']
+
+@dataclass
+class CachedSheet:
+    """Cached sheet information"""
+    sheet_id: int
+    name: str
+    columns: Dict[str, int]  # column_name -> column_id
+    has_helper_columns: bool
+    last_verified: str
+    row_count: Optional[int] = None
+
+class SheetCache:
+    """Manages cached sheet discovery data"""
+    
+    def __init__(self, cache_file: str):
+        self.cache_file = cache_file
+        self.cache_lock = RLock()  # Use reentrant lock to avoid deadlock
+        self.cache_data = self._load_cache()
+    
+    def _load_cache(self) -> Dict:
+        """Load cache from JSON file"""
+        if os.path.exists(self.cache_file):
+            try:
+                with open(self.cache_file, 'r') as f:
+                    data = json.load(f)
+                logging.info(f"📚 Loaded cache with {len(data.get('sheets', {}))} sheets")
+                return data
+            except Exception as e:
+                logging.warning(f"Could not load cache: {e}")
+        return {"sheets": {}, "last_updated": None}
+    
+    def save_cache(self):
+        """Save cache to JSON file"""
+        with self.cache_lock:
+            try:
+                self.cache_data["last_updated"] = datetime.now().isoformat()
+                with open(self.cache_file, 'w') as f:
+                    json.dump(self.cache_data, f, indent=2, default=str)
+                logging.info(f"💾 Saved cache with {len(self.cache_data['sheets'])} sheets")
+            except Exception as e:
+                logging.error(f"Could not save cache: {e}")
+    
+    def get_sheet(self, sheet_id: int) -> Optional[CachedSheet]:
+        """Get cached sheet info if not expired"""
+        sheet_str = str(sheet_id)
+        if sheet_str in self.cache_data["sheets"]:
+            sheet_data = self.cache_data["sheets"][sheet_str]
+            last_verified = datetime.fromisoformat(sheet_data["last_verified"])
+            if datetime.now() - last_verified < timedelta(days=CACHE_EXPIRY_DAYS):
+                return CachedSheet(**sheet_data)
+        return None
+    
+    def add_sheet(self, sheet: CachedSheet):
+        """Add or update sheet in cache"""
+        with self.cache_lock:
+            self.cache_data["sheets"][str(sheet.sheet_id)] = asdict(sheet)
+            self.save_cache()
+    
+    def get_all_valid_sheets(self) -> List[CachedSheet]:
+        """Get all non-expired cached sheets"""
+        valid_sheets = []
+        for sheet_id, sheet_data in self.cache_data["sheets"].items():
+            sheet = self.get_sheet(int(sheet_id))
+            if sheet:
+                valid_sheets.append(sheet)
+        return valid_sheets
+
+class EnhancedRateLimiter:
+    """Rate limiter with burst capacity and request queuing"""
+    
+    def __init__(self, max_requests=RATE_LIMIT_REQUESTS, window=RATE_LIMIT_WINDOW, burst=BURST_CAPACITY):
         self.max_requests = max_requests
         self.window = window
-        self.request_times = []
+        self.burst_capacity = burst
+        self.request_times = deque()
         self.lock = Lock()
-        
-    def acquire(self):
-        """Wait if necessary to respect rate limits"""
+        self.total_requests = 0
+        self.total_wait_time = 0
+    
+    def acquire(self, priority=1):
+        """Acquire permission to make a request"""
         with self.lock:
             now = time.time()
-            # Remove old requests outside the window
-            self.request_times = [t for t in self.request_times if now - t < self.window]
             
-            # If we're at the limit, wait
-            if len(self.request_times) >= self.max_requests:
-                sleep_time = self.window - (now - self.request_times[0]) + 0.1
-                if sleep_time > 0:
-                    logging.debug(f"Rate limit reached, sleeping for {sleep_time:.2f} seconds")
-                    time.sleep(sleep_time)
+            # Remove old requests outside the window
+            while self.request_times and self.request_times[0] < now - self.window:
+                self.request_times.popleft()
+            
+            # Check if we need to wait
+            current_count = len(self.request_times)
+            
+            if current_count >= self.max_requests:
+                # Calculate wait time
+                wait_time = self.request_times[0] + self.window - now
+                if wait_time > 0:
+                    self.total_wait_time += wait_time
+                    logging.debug(f"⏳ Rate limit: waiting {wait_time:.1f}s (req #{self.total_requests+1})")
+                    time.sleep(wait_time)
                     now = time.time()
-                    self.request_times = [t for t in self.request_times if now - t < self.window]
+                    
+                    # Clean again after waiting
+                    while self.request_times and self.request_times[0] < now - self.window:
+                        self.request_times.popleft()
+            
+            # Allow burst if under burst capacity
+            elif current_count >= self.max_requests - self.burst_capacity:
+                # Small delay to prevent hitting hard limit
+                time.sleep(0.1)
             
             self.request_times.append(now)
+            self.total_requests += 1
+    
+    def get_stats(self):
+        """Get rate limiter statistics"""
+        return {
+            "total_requests": self.total_requests,
+            "total_wait_time": self.total_wait_time,
+            "current_rate": len(self.request_times)
+        }
 
-rate_limiter = RateLimiter()
+# Global instances
+rate_limiter = EnhancedRateLimiter()
+sheet_cache = SheetCache(CACHE_FILE)
 
-# Performance tracking
-class PerformanceTracker:
-    def __init__(self):
-        self.start_time = None
-        self.stage_times = {}
-        self.sheet_counts = {}
-        
-    def start(self):
-        self.start_time = time.time()
-        logging.info("=" * 60)
-        logging.info("PERFORMANCE TRACKING ENABLED")
-        logging.info("=" * 60)
-        
-    def start_stage(self, stage_name):
-        self.stage_times[stage_name] = {'start': time.time()}
-        logging.info(f"[TIMER] Starting stage: {stage_name}")
-        
-    def end_stage(self, stage_name, details=None):
-        if stage_name in self.stage_times:
-            elapsed = time.time() - self.stage_times[stage_name]['start']
-            self.stage_times[stage_name]['elapsed'] = elapsed
-            msg = f"[TIMER] Completed stage: {stage_name} - Duration: {elapsed:.2f}s"
-            if details:
-                msg += f" - {details}"
-            logging.info(msg)
+def make_api_call(func, *args, **kwargs):
+    """Enhanced API call with better error handling"""
+    rate_limiter.acquire()
+    max_retries = 10
+    base_delay = 1
+    
+    for attempt in range(max_retries):
+        try:
+            return func(*args, **kwargs)
             
-    def record_sheet_info(self, sheet_id, row_count):
-        self.sheet_counts[sheet_id] = row_count
-        
-    def print_summary(self):
-        if self.start_time:
-            total_time = time.time() - self.start_time
-            logging.info("=" * 60)
-            logging.info("PERFORMANCE SUMMARY")
-            logging.info("-" * 60)
-            for stage, times in self.stage_times.items():
-                if 'elapsed' in times:
-                    percentage = (times['elapsed'] / total_time) * 100
-                    logging.info(f"  {stage}: {times['elapsed']:.2f}s ({percentage:.1f}%)")
-            logging.info("-" * 60)
-            total_rows = sum(self.sheet_counts.values())
-            logging.info(f"Total sheets processed: {len(self.sheet_counts)}")
-            logging.info(f"Total rows processed: {total_rows}")
-            logging.info(f"Total execution time: {total_time:.2f} seconds")
-            if total_time > 60:
-                logging.info(f"Total execution time: {total_time/60:.2f} minutes")
-            logging.info("=" * 60)
+        except smartsheet.exceptions.ApiError as e:
+            error_code = getattr(e.error.result, 'error_code', None)
+            status_code = getattr(e.error.result, 'status_code', None)
+            
+            if error_code == 4003 or status_code == 429:
+                wait_time = min(base_delay * (2 ** attempt), 60)
+                if hasattr(e.error.result, 'headers'):
+                    retry_after = e.error.result.headers.get('Retry-After')
+                    if retry_after:
+                        wait_time = int(retry_after)
+                
+                logging.warning(f"⏳ Rate limit (attempt {attempt+1}). Waiting {wait_time}s...")
+                time.sleep(wait_time)
+                continue
+                
+            elif status_code in [503, 408, 502, 504]:
+                wait_time = min(base_delay * (2 ** attempt), 30)
+                logging.warning(f"⚠️ Service issue. Waiting {wait_time}s...")
+                time.sleep(wait_time)
+                continue
+            else:
+                logging.error(f"API Error: {e}")
+                raise
+                
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(base_delay)
+                continue
+            raise
+    
+    raise Exception(f"Failed after {max_retries} attempts")
 
-perf_tracker = PerformanceTracker()
+def should_check_sheet(sheet_name: str) -> bool:
+    """Check if sheet matches our patterns"""
+    sheet_name_lower = sheet_name.lower()
+    for pattern in SHEET_NAME_PATTERNS:
+        if pattern.lower() in sheet_name_lower:
+            return True
+    return False
 
 def should_exclude_value(value):
-    """Check if a value should be excluded from processing"""
+    """Check if value contains excluded patterns"""
     if not value:
         return False
-    
-    value_str = str(value).strip().lower()
+    value_str = str(value).lower()
     for pattern in EXCLUDE_PATTERNS:
         if pattern.lower() in value_str:
             return True
     return False
 
-def clean_job_number_for_display(job_num):
-    """Clean job number for display"""
-    if not job_num or should_exclude_value(job_num):
-        return "Not Assigned"
-    return str(job_num).strip()
+def find_column_id(columns, patterns):
+    """Find column ID matching any of the patterns"""
+    for col in columns:
+        col_title_lower = col.title.lower()
+        for pattern in patterns:
+            if pattern.lower() in col_title_lower:
+                return col.id
+    return None
 
-def make_api_call(func, *args, **kwargs):
-    """Wrapper for API calls with rate limiting and error handling"""
-    rate_limiter.acquire()
-    max_retries = 3
-    retry_delay = 1
-    
-    for attempt in range(max_retries):
-        try:
-            return func(*args, **kwargs)
-        except smartsheet.exceptions.ApiError as e:
-            if e.error.result.error_code == 4003:  # Rate limit error
-                wait_time = retry_delay * (2 ** attempt)
-                logging.warning(f"Rate limit hit, waiting {wait_time} seconds...")
-                time.sleep(wait_time)
-            else:
-                raise
-    
-    # If we get here, all retries failed
-    raise Exception(f"Failed after {max_retries} attempts")
-
-def discover_target_sheets_optimized(client):
-    """
-    Optimized sheet discovery that caches metadata and avoids double-fetching
-    """
-    perf_tracker.start_stage("Sheet Discovery")
-    logging.info("Discovering sheets with required columns...")
-    discovered_sheets = []
-    sheet_metadata_cache = {}  # Cache for later use
-    
+def check_sheet_columns(client, sheet_id: int, sheet_name: str) -> Optional[CachedSheet]:
+    """Check if sheet has required columns and cache the result"""
     try:
-        # Get list of all sheets
-        sheets_response = make_api_call(client.Sheets.list_sheets, include_all=True)
-        total_sheets = len(sheets_response.data)
-        logging.info(f"Found {total_sheets} total sheets to check")
+        # Check cache first
+        cached = sheet_cache.get_sheet(sheet_id)
+        if cached:
+            logging.info(f"  📋 Using cached info for '{sheet_name}'")
+            return cached
         
-        sheets_to_check = []
-        for sheet_info in sheets_response.data:
-            if sheet_info.id != STATE_SHEET_ID:
-                sheets_to_check.append((sheet_info.id, sheet_info.name))
-            else:
-                logging.info(f"Skipping state sheet: {sheet_info.name} (ID: {sheet_info.id})")
+        # Fetch sheet with columns
+        sheet = make_api_call(client.Sheets.get_sheet, sheet_id, include='columns')
         
-        # Process sheets in parallel
-        processed_count = 0
+        # Find required columns
+        dept_col = find_column_id(sheet.columns, ['dept #', 'dept#', 'department #'])
+        work_req_col = find_column_id(sheet.columns, ['work request #', 'work request#', 'wr #'])
+        job_col = find_column_id(sheet.columns, ['job #', 'job#', 'job number'])
+        
+        if not all([dept_col, work_req_col, job_col]):
+            return None
+        
+        # Check for helper columns
+        helper_dept_col = find_column_id(sheet.columns, ['helper dept #', 'helper dept#'])
+        helper_job_col = find_column_id(sheet.columns, ['helper job [#]', 'helper job#', 'helper job'])
+        has_helper = bool(helper_dept_col and helper_job_col)
+        
+        # Create cached sheet
+        cached_sheet = CachedSheet(
+            sheet_id=sheet_id,
+            name=sheet_name,
+            columns={
+                'dept': dept_col,
+                'work_request': work_req_col,
+                'job': job_col,
+                'helper_dept': helper_dept_col if helper_dept_col else None,
+                'helper_job': helper_job_col if helper_job_col else None
+            },
+            has_helper_columns=has_helper,
+            last_verified=datetime.now().isoformat(),
+            row_count=sheet.total_row_count
+        )
+        
+        # Cache the result
+        sheet_cache.add_sheet(cached_sheet)
+        
+        logging.info(f"  ✅ Found all required columns in '{sheet_name}'")
+        if has_helper:
+            logging.info(f"  ✅ Also has helper columns")
+        
+        return cached_sheet
+        
+    except Exception as e:
+        logging.error(f"Error checking sheet {sheet_id}: {e}")
+        return None
+
+def discover_sheets_parallel(client) -> List[CachedSheet]:
+    """Discover sheets using parallel processing"""
+    logging.info("🔍 Starting parallel sheet discovery...")
+    
+    # Get all sheets
+    sheets_response = make_api_call(client.Sheets.list_sheets, include_all=True)
+    total_sheets = sheets_response.total_count
+    logging.info(f"Found {total_sheets} total sheets")
+    
+    # Get sheets from target folders
+    workspace_sheet_ids = set()
+    
+    if TARGET_FOLDER_IDS:
+        logging.info(f"Looking in folders: {TARGET_FOLDER_IDS}")
+        for folder_id in TARGET_FOLDER_IDS:
+            try:
+                folder = make_api_call(client.Folders.get_folder, folder_id)
+                if folder.sheets:
+                    for sheet in folder.sheets:
+                        workspace_sheet_ids.add(sheet.id)
+                    logging.info(f"  Found {len(folder.sheets)} sheets in folder {folder_id}")
+                
+                # Check subfolders
+                if folder.folders:
+                    for subfolder in folder.folders:
+                        try:
+                            sub = make_api_call(client.Folders.get_folder, subfolder.id)
+                            if sub.sheets:
+                                for sheet in sub.sheets:
+                                    workspace_sheet_ids.add(sheet.id)
+                                logging.info(f"    Found {len(sub.sheets)} sheets in subfolder {subfolder.name}")
+                        except:
+                            pass
+            except Exception as e:
+                logging.warning(f"Could not access folder {folder_id}: {e}")
+    
+    # Filter candidate sheets
+    candidates = []
+    for sheet_info in sheets_response.data:
+        if sheet_info.id in workspace_sheet_ids and should_check_sheet(sheet_info.name):
+            candidates.append((sheet_info.id, sheet_info.name))
+    
+    logging.info(f"Found {len(candidates)} candidate sheets to check")
+    
+    # Check cached sheets first
+    qualified_sheets = []
+    sheets_to_check = []
+    
+    for sheet_id, sheet_name in candidates:
+        cached = sheet_cache.get_sheet(sheet_id)
+        if cached:
+            qualified_sheets.append(cached)
+            logging.info(f"✨ Using cached: {sheet_name}")
+        else:
+            sheets_to_check.append((sheet_id, sheet_name))
+    
+    # Parallel check for new sheets
+    if sheets_to_check:
+        logging.info(f"📡 Checking {len(sheets_to_check)} new sheets in parallel...")
+        
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            future_to_sheet = {}
+            futures = {
+                executor.submit(check_sheet_columns, client, sheet_id, sheet_name): (sheet_id, sheet_name)
+                for sheet_id, sheet_name in sheets_to_check
+            }
             
-            for sheet_id, sheet_name in sheets_to_check:
-                future = executor.submit(check_sheet_columns, client, sheet_id, sheet_name)
-                future_to_sheet[future] = (sheet_id, sheet_name)
-            
-            for future in as_completed(future_to_sheet):
-                sheet_id, sheet_name = future_to_sheet[future]
-                processed_count += 1
-                
-                if processed_count % PROGRESS_UPDATE_INTERVAL == 0:
-                    logging.info(f"Discovery progress: {processed_count}/{len(sheets_to_check)} sheets checked")
-                
+            for future in as_completed(futures):
+                sheet_id, sheet_name = futures[future]
                 try:
                     result = future.result()
                     if result:
-                        discovered_sheets.append(result['config'])
-                        sheet_metadata_cache[sheet_id] = result['metadata']
-                        
-                        # Log discovery
-                        if sheet_id in ORIGINAL_SHEET_IDS:
-                            helper_status = " (with helper columns)" if result['config']["has_helper_columns"] else ""
-                            logging.info(f"✅ Found qualifying sheet: {sheet_name} (ID: {sheet_id}) [ORIGINAL]{helper_status}")
-                        else:
-                            helper_status = " (with helper columns)" if result['config']["has_helper_columns"] else ""
-                            logging.info(f"✅ Found qualifying sheet: {sheet_name} (ID: {sheet_id}) [NEW]{helper_status}")
-                    else:
-                        if DEBUG_SHEET_DISCOVERY:
-                            logging.debug(f"⏭️  Skipping sheet '{sheet_name}' - missing required columns")
-                        
+                        qualified_sheets.append(result)
+                        logging.info(f"  ✅ Qualified: {sheet_name}")
                 except Exception as e:
-                    logging.warning(f"Error processing sheet '{sheet_name}' (ID: {sheet_id}): {e}")
-                    continue
-                    
-    except Exception as e:
-        logging.error(f"Failed to discover sheets: {e}")
-        raise
+                    logging.error(f"Error checking {sheet_name}: {e}")
     
-    perf_tracker.end_stage("Sheet Discovery", f"Found {len(discovered_sheets)} qualifying sheets")
-    return discovered_sheets, sheet_metadata_cache
+    logging.info(f"📊 Found {len(qualified_sheets)} qualifying sheets total")
+    return qualified_sheets
 
-def check_sheet_columns(client, sheet_id, sheet_name):
-    """Check if a sheet has required columns (used for parallel processing)"""
+def process_sheet_batch(client, sheet_info: CachedSheet, state_tracker) -> Dict:
+    """Process a single sheet with batch operations"""
+    stats = {"rows_processed": 0, "numbers_generated": 0, "errors": 0}
+    
     try:
-        # Get only column information, not full sheet data
-        sheet = make_api_call(client.Sheets.get_sheet, sheet_id, include='columns')
+        logging.info(f"📄 Processing: {sheet_info.name}")
         
-        # Build column map
-        column_map = {}
-        for column in sheet.columns:
-            if column.title:
-                column_map[column.title.lower()] = column.id
+        # Get the full sheet data
+        sheet = make_api_call(
+            client.Sheets.get_sheet,
+            sheet_info.sheet_id,
+            include='rows'
+        )
         
-        # Check required columns
-        required_columns_found = {}
-        missing_columns = []
+        if not sheet.rows:
+            logging.info(f"  ⚠️ No rows in {sheet_info.name}")
+            return stats
         
-        for req_col in REQUIRED_COLUMNS:
-            if req_col.lower() in column_map:
-                if req_col == "Dept #":
-                    required_columns_found["dept"] = column_map[req_col.lower()]
-                elif req_col == "Work Request #":
-                    required_columns_found["wr_num"] = column_map[req_col.lower()]
-                elif req_col == "Job #":
-                    required_columns_found["job_num"] = column_map[req_col.lower()]
+        # Prepare batch updates
+        rows_to_update = []
+        
+        for row in sheet.rows:
+            # Get cell values
+            dept_val = None
+            work_req_val = None
+            job_val = None
+            helper_dept_val = None
+            helper_job_val = None
+            
+            for cell in row.cells:
+                if cell.column_id == sheet_info.columns['dept']:
+                    dept_val = cell.value
+                elif cell.column_id == sheet_info.columns['work_request']:
+                    work_req_val = cell.value
+                elif cell.column_id == sheet_info.columns['job']:
+                    job_val = cell.value
+                elif sheet_info.columns.get('helper_dept') and cell.column_id == sheet_info.columns['helper_dept']:
+                    helper_dept_val = cell.value
+                elif sheet_info.columns.get('helper_job') and cell.column_id == sheet_info.columns['helper_job']:
+                    helper_job_val = cell.value
+            
+            # Skip if excluded values
+            if any(should_exclude_value(v) for v in [dept_val, work_req_val]):
+                continue
+            
+            cells_to_update = []
+            
+            # Process main job number
+            if dept_val and work_req_val and not job_val:
+                key = f"{dept_val}|{work_req_val}"
+                job_number = state_tracker.get_or_create_number(key, 'main')
+                
+                cells_to_update.append(
+                    client.models.Cell({
+                        'column_id': sheet_info.columns['job'],
+                        'value': job_number
+                    })
+                )
+                stats["numbers_generated"] += 1
+            
+            # Process helper columns if present
+            if sheet_info.has_helper_columns and helper_dept_val and not helper_job_val:
+                helper_key = f"HELPER|{helper_dept_val}"
+                helper_number = state_tracker.get_or_create_number(helper_key, 'helper')
+                
+                cells_to_update.append(
+                    client.models.Cell({
+                        'column_id': sheet_info.columns['helper_job'],
+                        'value': helper_number
+                    })
+                )
+                stats["numbers_generated"] += 1
+            
+            # Add to batch if we have updates
+            if cells_to_update:
+                rows_to_update.append(
+                    client.models.Row({
+                        'id': row.id,
+                        'cells': cells_to_update
+                    })
+                )
+            
+            stats["rows_processed"] += 1
+            
+            # Send batch when it reaches size limit
+            if len(rows_to_update) >= BATCH_SIZE:
+                try:
+                    make_api_call(
+                        client.Sheets.update_rows,
+                        sheet_info.sheet_id,
+                        rows_to_update
+                    )
+                    logging.info(f"  ✅ Batch updated {len(rows_to_update)} rows")
+                    rows_to_update = []
+                except Exception as e:
+                    logging.error(f"Batch update failed: {e}")
+                    stats["errors"] += len(rows_to_update)
+                    rows_to_update = []
+        
+        # Send remaining updates
+        if rows_to_update:
+            try:
+                make_api_call(
+                    client.Sheets.update_rows,
+                    sheet_info.sheet_id,
+                    rows_to_update
+                )
+                logging.info(f"  ✅ Final batch updated {len(rows_to_update)} rows")
+            except Exception as e:
+                logging.error(f"Final batch update failed: {e}")
+                stats["errors"] += len(rows_to_update)
+        
+        logging.info(f"  ✅ Completed: {stats['rows_processed']} rows, {stats['numbers_generated']} numbers generated")
+        
+    except Exception as e:
+        logging.error(f"Error processing sheet {sheet_info.name}: {e}")
+        stats["errors"] += 1
+    
+    return stats
+
+class StateTracker:
+    """Manages job number state and generation"""
+    
+    def __init__(self, client):
+        self.client = client
+        self.main_numbers = {}
+        self.helper_numbers = {}
+        self.lock = Lock()
+        self.next_main_number = 1
+        self.next_helper_number = 1
+        self.column_ids = {}  # Cache column IDs to avoid repeated API calls
+        self.load_state()
+    
+    def load_state(self):
+        """Load existing numbers from state sheet"""
+        try:
+            sheet = make_api_call(self.client.Sheets.get_sheet, STATE_SHEET_ID, include='columns')
+            
+            # Cache column IDs to avoid repeated lookups
+            for col in sheet.columns:
+                self.column_ids[col.title.lower()] = col.id
+            
+            for row in sheet.rows:
+                key = None
+                number = None
+                
+                for cell in row.cells:
+                    col_name = next((c.title for c in sheet.columns if c.id == cell.column_id), '')
+                    if col_name.lower() == 'key':
+                        key = cell.value
+                    elif col_name.lower() == 'generated number':
+                        number = cell.value
+                
+                if key and number:
+                    if key.startswith('HELPER|'):
+                        self.helper_numbers[key] = number
+                        try:
+                            num_val = int(number.replace('H', ''))
+                            self.next_helper_number = max(self.next_helper_number, num_val + 1)
+                        except:
+                            pass
+                    else:
+                        self.main_numbers[key] = number
+                        try:
+                            self.next_main_number = max(self.next_main_number, int(number) + 1)
+                        except:
+                            pass
+            
+            logging.info(f"📚 Loaded {len(self.main_numbers)} main numbers, {len(self.helper_numbers)} helper numbers")
+            
+        except Exception as e:
+            logging.error(f"Could not load state: {e}")
+    
+    def get_or_create_number(self, key: str, number_type: str) -> str:
+        """Get existing or create new job number"""
+        with self.lock:
+            if number_type == 'helper':
+                if key in self.helper_numbers:
+                    return self.helper_numbers[key]
+                
+                number = f"H{self.next_helper_number:05d}"
+                self.helper_numbers[key] = number
+                self.next_helper_number += 1
+                self.save_number(key, number)
+                return number
             else:
-                missing_columns.append(req_col)
-        
-        # Check optional helper columns
-        helper_columns_found = {}
-        for helper_col in OPTIONAL_HELPER_COLUMNS:
-            if helper_col.lower() in column_map:
-                if helper_col == "Helper Dept #":
-                    helper_columns_found["helper_dept"] = column_map[helper_col.lower()]
-                elif helper_col == "Helper Job [#]":
-                    helper_columns_found["helper_job_num"] = column_map[helper_col.lower()]
-        
-        if not missing_columns:
-            # All required columns found
-            all_columns = {**required_columns_found, **helper_columns_found}
-            
-            sheet_config = {
-                "sheet_id": sheet_id,
-                "sheet_name": sheet_name,
-                "columns": all_columns,
-                "has_helper_columns": ("helper_dept" in helper_columns_found and 
-                                      "helper_job_num" in helper_columns_found)
-            }
-            
-            # Return both config and metadata for caching
-            return {
-                'config': sheet_config,
-                'metadata': {
-                    'columns': column_map,
-                    'total_columns': len(sheet.columns)
-                }
-            }
-        
-        return None
-        
-    except smartsheet.exceptions.ApiError as e:
-        logging.warning(f"Could not access sheet '{sheet_name}' (ID: {sheet_id}). Error: {e.error.result}")
-        return None
-    except Exception as e:
-        logging.warning(f"Error checking sheet '{sheet_name}' (ID: {sheet_id}): {e}")
-        return None
-
-def fetch_sheet_rows(client, sheet_config):
-    """Fetch rows from a single sheet with selective column fetching"""
-    sheet_id = sheet_config["sheet_id"]
-    columns = sheet_config["columns"]
-    has_helper = sheet_config["has_helper_columns"]
+                if key in self.main_numbers:
+                    return self.main_numbers[key]
+                
+                number = str(self.next_main_number)
+                self.main_numbers[key] = number
+                self.next_main_number += 1
+                self.save_number(key, number)
+                return number
     
-    try:
-        # Fetch only required column IDs to reduce payload
-        column_ids = list(columns.values())
-        
-        # Use pagination for large sheets
-        page_size = 500
-        page_number = 1
-        all_rows = []
-        
-        while True:
-            sheet = make_api_call(
-                client.Sheets.get_sheet,
-                sheet_id,
-                column_ids=column_ids,
-                page_size=page_size,
-                page=page_number
+    def save_number(self, key: str, number: str):
+        """Save new number to state sheet"""
+        try:
+            new_row = self.client.models.Row()
+            new_row.cells.append({
+                'column_id': self.get_column_id('key'),
+                'value': key
+            })
+            new_row.cells.append({
+                'column_id': self.get_column_id('generated number'),
+                'value': number
+            })
+            
+            make_api_call(
+                self.client.Sheets.add_rows,
+                STATE_SHEET_ID,
+                [new_row]
             )
             
-            if not sheet.rows:
-                break
-                
-            for row in sheet.rows:
-                cell_map = {cell.column_id: cell for cell in row.cells}
-                dept_cell = cell_map.get(columns["dept"])
-                wr_num_cell = cell_map.get(columns["wr_num"])
-                job_num_cell = cell_map.get(columns["job_num"])
-                
-                dept = dept_cell.display_value if dept_cell and dept_cell.display_value else None
-                wr_num = wr_num_cell.display_value if wr_num_cell and wr_num_cell.display_value else None
-                job_num = job_num_cell.display_value if job_num_cell else None
-                
-                # Read helper columns if present
-                helper_dept = None
-                helper_job_num = None
-                if has_helper:
-                    helper_dept_cell = cell_map.get(columns["helper_dept"])
-                    helper_job_num_cell = cell_map.get(columns["helper_job_num"])
-                    helper_dept = helper_dept_cell.display_value if helper_dept_cell and helper_dept_cell.display_value else None
-                    helper_job_num = helper_job_num_cell.display_value if helper_job_num_cell else None
-                
-                # Filter out excluded values
-                if dept and wr_num and not should_exclude_value(dept) and not should_exclude_value(wr_num):
-                    all_rows.append({
-                        "sheet_id": sheet_id,
-                        "row_id": row.id,
-                        "columns": columns,
-                        "has_helper": has_helper,
-                        "dept": dept,
-                        "wr_num": wr_num,
-                        "job_num": job_num,
-                        "helper_dept": helper_dept,
-                        "helper_job_num": helper_job_num,
-                    })
-            
-            # Check if more pages available
-            if len(sheet.rows) < page_size:
-                break
-            
-            page_number += 1
-        
-        perf_tracker.record_sheet_info(sheet_id, len(all_rows))
-        logging.info(f"Fetched {len(all_rows)} rows from sheet {sheet_config['sheet_name']}")
-        return all_rows
-        
-    except Exception as e:
-        logging.error(f"Error fetching rows from sheet {sheet_id}: {e}")
-        return []
+        except Exception as e:
+            logging.error(f"Could not save state: {e}")
+    
+    def get_column_id(self, col_name: str):
+        """Get column ID from cached IDs"""
+        col_id = self.column_ids.get(col_name.lower())
+        if col_id:
+            return col_id
+        # Fall back to fetching if not cached (shouldn't happen normally)
+        sheet = make_api_call(self.client.Sheets.get_sheet, STATE_SHEET_ID, include='columns')
+        for col in sheet.columns:
+            if col.title.lower() == col_name.lower():
+                self.column_ids[col_name.lower()] = col.id
+                return col.id
+        raise ValueError(f"Column '{col_name}' not found in state sheet")
 
-def gather_all_rows_parallel(client, sheet_configs):
-    """Gather rows from all sheets in parallel"""
-    perf_tracker.start_stage("Parallel Row Collection")
-    all_rows = []
-    total_sheets = len(sheet_configs)
-    
-    logging.info(f"Fetching rows from {total_sheets} sheets in parallel...")
-    
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_sheet = {}
-        
-        for sheet_config in sheet_configs:
-            future = executor.submit(fetch_sheet_rows, client, sheet_config)
-            future_to_sheet[future] = sheet_config["sheet_name"]
-        
-        completed_count = 0
-        for future in as_completed(future_to_sheet):
-            sheet_name = future_to_sheet[future]
-            completed_count += 1
-            
-            # Progress update
-            percentage = (completed_count / total_sheets) * 100
-            logging.info(f"Progress: {completed_count}/{total_sheets} sheets processed ({percentage:.1f}%)")
-            
-            try:
-                rows = future.result()
-                all_rows.extend(rows)
-            except Exception as e:
-                logging.error(f"Failed to fetch rows from {sheet_name}: {e}")
-    
-    perf_tracker.end_stage("Parallel Row Collection", f"Collected {len(all_rows)} total rows")
-    return all_rows
-
-def analyze_existing_job_number_format(all_rows):
-    """Analyze existing job numbers to determine the naming convention pattern"""
-    existing_job_numbers = []
-    dept_patterns = defaultdict(list)
-    
-    for entry in all_rows:
-        if entry["job_num"] and str(entry["job_num"]).strip() and not should_exclude_value(entry["job_num"]):
-            job_num = str(entry["job_num"]).strip()
-            existing_job_numbers.append(job_num)
-            dept_patterns[entry["dept"]].append(job_num)
-    
-    if not existing_job_numbers:
-        logging.info("No existing job numbers found. Using default format: DEPT-###")
-        return lambda dept, counter: f"{dept}-{counter:03d}"
-    
-    logging.info(f"Analyzing {len(existing_job_numbers)} existing job numbers to detect pattern...")
-    
-    # Simplified pattern detection for performance
-    sample_jobs = existing_job_numbers[:5]
-    logging.info(f"Sample existing job numbers: {sample_jobs}")
-    
-    # Quick pattern check
-    if sample_jobs:
-        sample = sample_jobs[0]
-        import re
-        if re.match(r'^[A-Z]+-\d{3}$', sample):
-            return lambda dept, counter: f"{dept}-{counter:03d}"
-        elif re.match(r'^[A-Z]+-\d+$', sample):
-            return lambda dept, counter: f"{dept}-{counter}"
-    
-    # Default fallback
-    logging.info("Using default format: DEPT-###")
-    return lambda dept, counter: f"{dept}-{counter:03d}"
-
-def get_state_sheet_columns_cached(client):
-    """Get state sheet columns with caching to avoid redundant calls"""
-    if not hasattr(get_state_sheet_columns_cached, 'cache'):
-        get_state_sheet_columns_cached.cache = {}
-    
-    if STATE_SHEET_ID in get_state_sheet_columns_cached.cache:
-        return get_state_sheet_columns_cached.cache[STATE_SHEET_ID]
-    
-    try:
-        state_sheet = make_api_call(client.Sheets.get_sheet, STATE_SHEET_ID, include='columns')
-        column_map = {}
-        
-        for column in state_sheet.columns:
-            if column.title:
-                column_name = column.title.lower()
-                if column_name == STATE_COLUMN_NAMES['key'].lower():
-                    column_map['key'] = column.id
-                elif column_name == STATE_COLUMN_NAMES['value'].lower():
-                    column_map['value'] = column.id
-        
-        if 'key' not in column_map or 'value' not in column_map:
-            missing = []
-            if 'key' not in column_map:
-                missing.append(STATE_COLUMN_NAMES['key'])
-            if 'value' not in column_map:
-                missing.append(STATE_COLUMN_NAMES['value'])
-            raise Exception(f"State sheet is missing required columns: {missing}")
-        
-        # Cache the result
-        get_state_sheet_columns_cached.cache[STATE_SHEET_ID] = column_map
-        logging.info(f"✅ Cached state sheet columns - key: {column_map['key']}, value: {column_map['value']}")
-        return column_map
-        
-    except Exception as e:
-        raise Exception(f"Error discovering state sheet columns: {e}")
-
-def load_state_optimized(client, state_key):
-    """Load state with caching to reduce API calls"""
-    logging.info(f"Loading {state_key} from State Sheet ID: {STATE_SHEET_ID}")
-    
-    try:
-        state_column_map = get_state_sheet_columns_cached(client)
-        state_sheet = make_api_call(client.Sheets.get_sheet, STATE_SHEET_ID)
-        
-        for row in state_sheet.rows:
-            key_cell = next((cell for cell in row.cells if cell.column_id == state_column_map['key']), None)
-            if key_cell and key_cell.value == state_key:
-                value_cell = next((cell for cell in row.cells if cell.column_id == state_column_map['value']), None)
-                if value_cell and value_cell.value:
-                    try:
-                        state = json.loads(value_cell.value)
-                        logging.info(f"Found existing {state_key}. Loaded {len(state)} records.")
-                        return state
-                    except (json.JSONDecodeError, TypeError):
-                        logging.warning(f"{state_key} data is malformed. Starting fresh.")
-                        return {}
-        
-        logging.info(f"No previous {state_key} found. Starting fresh.")
-        return {}
-    except Exception as e:
-        logging.warning(f"Could not load {state_key}: {e}")
-        return {}
-
-def save_state_optimized(client, state_data, state_key):
-    """Save state with optimized API calls"""
-    logging.info(f"Saving {state_key} to State Sheet ID: {STATE_SHEET_ID}")
-    state_json = json.dumps(state_data, indent=2)
-    
-    try:
-        state_column_map = get_state_sheet_columns_cached(client)
-        state_sheet = make_api_call(client.Sheets.get_sheet, STATE_SHEET_ID, include=['rows'])
-        
-        state_row_id = None
-        for row in state_sheet.rows:
-            key_cell = next((cell for cell in row.cells if cell.column_id == state_column_map['key']), None)
-            if key_cell and key_cell.value == state_key:
-                state_row_id = row.id
-                break
-        
-        if state_row_id:
-            logging.info(f"Updating existing {state_key} row (ID: {state_row_id})...")
-            update_row = smartsheet.models.Row()
-            update_row.id = state_row_id
-            update_row.cells.append({'column_id': state_column_map['value'], 'value': state_json})
-            make_api_call(client.Sheets.update_rows, STATE_SHEET_ID, [update_row])
-        else:
-            logging.info(f"{state_key} row not found. Creating a new one...")
-            new_row = smartsheet.models.Row()
-            new_row.cells.append({'column_id': state_column_map['key'], 'value': state_key})
-            new_row.cells.append({'column_id': state_column_map['value'], 'value': state_json})
-            make_api_call(client.Sheets.add_rows, STATE_SHEET_ID, [new_row])
-        
-        logging.info(f"Successfully saved {state_key}.")
-    except Exception as e:
-        logging.error(f"Failed to save {state_key}: {e}")
-        raise
-
-def batch_update_sheets(client, updates_by_sheet):
-    """Update sheets in batches with progress tracking"""
-    perf_tracker.start_stage("Batch Updates")
-    total_sheets = len(updates_by_sheet)
-    updated_count = 0
-    
-    for sheet_id, rows in updates_by_sheet.items():
-        if rows:
-            # Split into batches if necessary
-            for i in range(0, len(rows), BATCH_SIZE):
-                batch = rows[i:i+BATCH_SIZE]
-                logging.info(f"Updating batch of {len(batch)} rows on sheet {sheet_id}")
-                make_api_call(client.Sheets.update_rows, sheet_id, batch)
-            
-            updated_count += 1
-            percentage = (updated_count / total_sheets) * 100
-            logging.info(f"✅ Updated sheet {sheet_id} ({updated_count}/{total_sheets} - {percentage:.1f}%)")
-    
-    perf_tracker.end_stage("Batch Updates", f"Updated {total_sheets} sheets")
-
-def estimate_time_remaining(start_time, items_done, total_items):
-    """Estimate time remaining based on current progress"""
-    if items_done == 0:
-        return "Calculating..."
-    
-    elapsed = time.time() - start_time
-    rate = items_done / elapsed
-    remaining_items = total_items - items_done
-    
-    if rate > 0:
-        remaining_seconds = remaining_items / rate
-        if remaining_seconds < 60:
-            return f"{remaining_seconds:.0f} seconds"
-        elif remaining_seconds < 3600:
-            return f"{remaining_seconds/60:.1f} minutes"
-        else:
-            return f"{remaining_seconds/3600:.1f} hours"
-    
-    return "Unknown"
+def format_time(seconds):
+    """Format seconds into human-readable time"""
+    if seconds < 60:
+        return f"{seconds:.1f} seconds"
+    elif seconds < 3600:
+        return f"{seconds/60:.1f} minutes"
+    else:
+        return f"{seconds/3600:.1f} hours"
 
 def main():
-    if not API_TOKEN:
-        logging.error("FATAL: SMARTSHEET_API_TOKEN environment variable not set.")
-        return
-
-    # Start performance tracking
-    perf_tracker.start()
-    overall_start = time.time()
+    """Main execution function"""
+    start_time = time.time()
     
-    logging.info(f"Starting optimized job number generator")
-    logging.info(f"Configuration: {MAX_WORKERS} workers, {RATE_LIMIT_REQUESTS} req/min rate limit")
-    logging.info(f"Excluded patterns: {EXCLUDE_PATTERNS}")
+    logging.info("=" * 60)
+    logging.info("🚀 OPTIMIZED JOB NUMBER GENERATOR - STARTING")
+    logging.info("=" * 60)
     
+    # Initialize Smartsheet client
     client = smartsheet.Smartsheet(API_TOKEN)
     client.errors_as_exceptions(True)
-
-    try:
-        # Load state (with caching)
-        perf_tracker.start_stage("Load State")
-        wr_to_job_map = load_state_optimized(client, STATE_DATA_KEY)
-        helper_wr_to_job_map = load_state_optimized(client, HELPER_STATE_DATA_KEY)
-        perf_tracker.end_stage("Load State")
-
-        # Discover sheets (optimized with caching)
-        sheet_configs, metadata_cache = discover_target_sheets_optimized(client)
+    
+    # Load state tracker
+    logging.info("\n📖 Step 1: Loading state...")
+    state_tracker = StateTracker(client)
+    
+    # Discover sheets
+    logging.info("\n🔍 Step 2: Discovering sheets...")
+    qualified_sheets = discover_sheets_parallel(client)
+    
+    if not qualified_sheets:
+        logging.warning("⚠️ No qualifying sheets found!")
+        return
+    
+    # Process sheets in parallel
+    logging.info(f"\n⚙️ Step 3: Processing {len(qualified_sheets)} sheets...")
+    
+    total_stats = {"rows_processed": 0, "numbers_generated": 0, "errors": 0}
+    processing_start = time.time()
+    
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(qualified_sheets))) as executor:
+        futures = {
+            executor.submit(process_sheet_batch, client, sheet, state_tracker): sheet
+            for sheet in qualified_sheets
+        }
         
-        if not sheet_configs:
-            logging.warning("No qualifying sheets found. Nothing to process.")
-            return
-        
-        # Log discovered sheets
-        logging.info(f"Processing {len(sheet_configs)} sheets:")
-        for cfg in sheet_configs:
-            logging.info(f"  - {cfg['sheet_name']} (ID: {cfg['sheet_id']})")
-
-        # Gather all rows in parallel
-        all_rows = gather_all_rows_parallel(client, sheet_configs)
-        logging.info(f"Total rows fetched: {len(all_rows)}")
-
-        # Analyze existing job number format
-        perf_tracker.start_stage("Format Analysis")
-        job_number_formatter = analyze_existing_job_number_format(all_rows)
-        perf_tracker.end_stage("Format Analysis")
-
-        # Process job number assignment
-        perf_tracker.start_stage("Job Number Assignment")
-        
-        # Build WR# to row map
-        wr_row_map = defaultdict(list)
-        for entry in all_rows:
-            wr_row_map[entry["wr_num"]].append(entry)
-
-        # Initialize counters from existing job numbers
-        dept_counters = defaultdict(int)
-        
-        # Parse existing job numbers for counters
-        for jobnum in list(wr_to_job_map.values()) + list(helper_wr_to_job_map.values()):
+        completed = 0
+        for future in as_completed(futures):
+            sheet = futures[future]
+            completed += 1
+            
             try:
-                if '-' in jobnum:
-                    parts = jobnum.split('-')
-                    if len(parts) >= 2 and parts[-1].isdigit():
-                        dept = parts[-2] if len(parts) > 1 else parts[0]
-                        num = int(parts[-1])
-                        dept_counters[dept] = max(dept_counters[dept], num)
-            except (ValueError, IndexError):
-                continue
-
-        # Check for duplicates
-        seen_sheets_per_wr = defaultdict(set)
-        for entry in all_rows:
-            seen_sheets_per_wr[entry["wr_num"]].add(entry["sheet_id"])
-
-        for wr_num, sheets in seen_sheets_per_wr.items():
-            if len(sheets) > 1:
-                logging.warning(f"Duplicate WR# '{wr_num}' found in {len(sheets)} sheets.")
-
-        # Assign job numbers and prepare updates
-        updates_by_sheet = defaultdict(list)
-        new_assignments = 0
-        update_count = 0
-        
-        for wr_num, entries in wr_row_map.items():
-            # Assign job number if not already assigned
-            if wr_num not in wr_to_job_map:
-                dept = entries[0]["dept"]
-                dept_counters[dept] += 1
-                job_number = job_number_formatter(dept, dept_counters[dept])
-                wr_to_job_map[wr_num] = job_number
-                new_assignments += 1
-                logging.debug(f"Assigned new job number: {job_number} for WR# {wr_num}")
-            else:
-                job_number = wr_to_job_map[wr_num]
-
-            # Update all rows for this WR#
-            for entry in entries:
-                current_job_num = entry["job_num"]
-                needs_update = (current_job_num != job_number or 
-                              should_exclude_value(current_job_num))
+                stats = future.result()
+                total_stats["rows_processed"] += stats["rows_processed"]
+                total_stats["numbers_generated"] += stats["numbers_generated"]
+                total_stats["errors"] += stats["errors"]
                 
-                # Handle helper columns
-                helper_job_number = None
-                helper_needs_update = False
-                if entry["has_helper"] and entry["helper_dept"] and not should_exclude_value(entry["helper_dept"]):
-                    helper_dept = entry["helper_dept"]
-                    helper_key = f"{wr_num}_{helper_dept}"
-                    
-                    if helper_key not in helper_wr_to_job_map:
-                        dept_counters[helper_dept] += 1
-                        helper_job_number = job_number_formatter(helper_dept, dept_counters[helper_dept])
-                        helper_wr_to_job_map[helper_key] = helper_job_number
-                        new_assignments += 1
-                    else:
-                        helper_job_number = helper_wr_to_job_map[helper_key]
-                    
-                    current_helper_job_num = entry["helper_job_num"]
-                    helper_needs_update = (current_helper_job_num != helper_job_number or 
-                                          should_exclude_value(current_helper_job_num))
+                # Calculate progress and time estimates
+                elapsed = time.time() - processing_start
+                avg_time_per_sheet = elapsed / completed
+                remaining_sheets = len(qualified_sheets) - completed
+                eta = avg_time_per_sheet * remaining_sheets
                 
-                if needs_update or helper_needs_update:
-                    update_row = smartsheet.models.Row()
-                    update_row.id = entry["row_id"]
-                    
-                    if needs_update:
-                        update_row.cells.append({
-                            'column_id': entry["columns"]["job_num"],
-                            'value': job_number,
-                            'strict': False
-                        })
-                        update_count += 1
-                    
-                    if helper_needs_update and helper_job_number:
-                        update_row.cells.append({
-                            'column_id': entry["columns"]["helper_job_num"],
-                            'value': helper_job_number,
-                            'strict': False
-                        })
-                        update_count += 1
-                    
-                    updates_by_sheet[entry["sheet_id"]].append(update_row)
-        
-        perf_tracker.end_stage("Job Number Assignment", f"{new_assignments} new assignments, {update_count} updates needed")
-
-        # Send batch updates
-        if updates_by_sheet:
-            batch_update_sheets(client, updates_by_sheet)
-        else:
-            logging.info("No updates needed - all job numbers are current")
-
-        # Save state
-        perf_tracker.start_stage("Save State")
-        save_state_optimized(client, wr_to_job_map, STATE_DATA_KEY)
-        save_state_optimized(client, helper_wr_to_job_map, HELPER_STATE_DATA_KEY)
-        perf_tracker.end_stage("Save State")
-
-        # Print performance summary
-        perf_tracker.print_summary()
-        
-        total_time = time.time() - overall_start
-        if total_time > 60:
-            logging.info(f"✨ Process complete in {total_time/60:.2f} minutes!")
-        else:
-            logging.info(f"✨ Process complete in {total_time:.2f} seconds!")
-
-    except Exception as e:
-        logging.error(f"An unexpected error occurred: {e}", exc_info=True)
-        perf_tracker.print_summary()
+                progress_pct = (completed / len(qualified_sheets)) * 100
+                
+                logging.info(f"📊 Progress: [{completed}/{len(qualified_sheets)}] {progress_pct:.1f}% | "
+                           f"ETA: {format_time(eta)} | Current: {sheet.name}")
+                
+            except Exception as e:
+                logging.error(f"Failed processing {sheet.name}: {e}")
+                total_stats["errors"] += 1
+    
+    # Final statistics
+    elapsed = time.time() - start_time
+    
+    logging.info("\n" + "=" * 60)
+    logging.info("✅ JOB NUMBER GENERATION COMPLETE!")
+    logging.info("=" * 60)
+    logging.info(f"📊 Final Statistics:")
+    logging.info(f"  • Sheets processed: {len(qualified_sheets)}")
+    logging.info(f"  • Rows processed: {total_stats['rows_processed']:,}")
+    logging.info(f"  • Numbers generated: {total_stats['numbers_generated']:,}")
+    logging.info(f"  • Errors: {total_stats['errors']}")
+    logging.info(f"  • Time taken: {elapsed:.1f} seconds")
+    logging.info(f"  • Processing speed: {total_stats['rows_processed']/elapsed:.1f} rows/second")
+    
+    # Rate limiter stats
+    rl_stats = rate_limiter.get_stats()
+    logging.info(f"\n📈 Rate Limiter Statistics:")
+    logging.info(f"  • Total API calls: {rl_stats['total_requests']}")
+    logging.info(f"  • Total wait time: {rl_stats['total_wait_time']:.1f} seconds")
+    logging.info(f"  • Average throughput: {rl_stats['total_requests']/elapsed:.1f} requests/second")
+    
+    logging.info("\n✨ Cache saved for faster future runs!")
 
 if __name__ == "__main__":
     main()

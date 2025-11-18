@@ -15,15 +15,15 @@ author = "agent"
 
 [[workflows.workflow.tasks]]
 task = "workflow.run"
-args = "Run Job Number Generator"
+args = "Run Optimized Job Generator"
 
 [[workflows.workflow]]
-name = "Run Job Number Generator"
+name = "Run Optimized Job Generator"
 author = "agent"
-
-[workflows.workflow.metadata]
-outputType = "console"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "python generate_job_numbers_fast.py"
+args = "python generate_job_numbers_optimized.py"
+
+[workflows.workflow.metadata]
+outputType = "console"
