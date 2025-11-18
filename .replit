@@ -26,4 +26,4 @@ outputType = "console"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "python generate_job_numbers_optimized.py"
+args = "python generate_job_numbers_fast.py"
