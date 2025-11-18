@@ -53,7 +53,13 @@ ENABLE_DISCOVERY = True  # ENABLED - Discover all sheets with required columns
 
 # Set to None to process sheets from ALL locations (including personal Sheets folder)
 # Set to a specific workspace ID to limit to that workspace only
-TARGET_WORKSPACE_ID = None  # Process sheets from all locations
+TARGET_WORKSPACE_ID = 2763941144225668  # Linetec - Resiliency workspace
+
+# The Resiliency Promax Database sheets are in nested folders
+TARGET_FOLDER_IDS = [
+    1257051776149380,  # Parent folder
+    7644752003786628   # Subfolder containing the sheets
+]
 
 STATE_SHEET_ID = 6534534683119492
 STATE_COLUMN_NAMES = {
@@ -181,24 +187,56 @@ def get_sheets_to_process(client):
         candidates = []
         
         if TARGET_WORKSPACE_ID:
-            # Filter by specific workspace
+            # Filter by specific workspace and folders
             logging.info(f"Filtering to workspace ID: {TARGET_WORKSPACE_ID}")
             
-            # Get list of sheets in target workspace
-            workspace_sheets = []
-            try:
-                # Get workspace sheets
-                workspace_response = make_api_call(client.Workspaces.get_workspace, TARGET_WORKSPACE_ID, 
-                                                 load_all=True, include='sheets')
-                if workspace_response.sheets:
-                    workspace_sheet_ids = set(sheet.id for sheet in workspace_response.sheets)
-                    logging.info(f"Found {len(workspace_sheet_ids)} sheets in target workspace")
-                else:
+            workspace_sheet_ids = set()
+            
+            # Get sheets from folders if specified
+            if TARGET_FOLDER_IDS:
+                logging.info(f"Looking for sheets in folders: {TARGET_FOLDER_IDS}")
+                
+                for folder_id in TARGET_FOLDER_IDS:
+                    try:
+                        # Get folder contents
+                        folder_response = make_api_call(client.Folders.get_folder, folder_id)
+                        
+                        # Add sheets in this folder
+                        if folder_response.sheets:
+                            for sheet in folder_response.sheets:
+                                workspace_sheet_ids.add(sheet.id)
+                            logging.info(f"  Found {len(folder_response.sheets)} sheets in folder {folder_id}")
+                        
+                        # Check subfolders
+                        if folder_response.folders:
+                            for subfolder in folder_response.folders:
+                                try:
+                                    subfolder_response = make_api_call(client.Folders.get_folder, subfolder.id)
+                                    if subfolder_response.sheets:
+                                        for sheet in subfolder_response.sheets:
+                                            workspace_sheet_ids.add(sheet.id)
+                                        logging.info(f"    Found {len(subfolder_response.sheets)} sheets in subfolder {subfolder.id} ({subfolder.name})")
+                                except Exception as e:
+                                    logging.debug(f"Could not access subfolder {subfolder.id}: {e}")
+                    except Exception as e:
+                        logging.warning(f"Could not access folder {folder_id}: {e}")
+                
+                logging.info(f"Total sheets found in folders: {len(workspace_sheet_ids)}")
+            
+            else:
+                # Get workspace root sheets (old method)
+                try:
+                    workspace_response = make_api_call(client.Workspaces.get_workspace, TARGET_WORKSPACE_ID, 
+                                                     load_all=True, include='sheets')
+                    if workspace_response.sheets:
+                        workspace_sheet_ids = set(sheet.id for sheet in workspace_response.sheets)
+                        logging.info(f"Found {len(workspace_sheet_ids)} sheets in target workspace root")
+                    else:
+                        workspace_sheet_ids = set()
+                        logging.warning("No sheets found in target workspace root")
+                except Exception as e:
+                    logging.error(f"Could not get workspace sheets: {e}")
                     workspace_sheet_ids = set()
-                    logging.warning("No sheets found in target workspace")
-            except Exception as e:
-                logging.error(f"Could not get workspace sheets: {e}")
-                workspace_sheet_ids = set()
             
             # Filter by workspace AND name patterns
             workspace_matches = 0
