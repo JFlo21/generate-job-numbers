@@ -55,7 +55,7 @@ SHEET_NAME_PATTERNS = [
 ]
 
 # Set to True to discover new sheets, False to only use KNOWN_JOB_SHEET_IDS
-ENABLE_DISCOVERY = False  # DISABLED - Only use known sheet IDs for speed
+ENABLE_DISCOVERY = True  # ENABLED - Discover all sheets with required columns
 
 STATE_SHEET_ID = 6534534683119492
 STATE_COLUMN_NAMES = {
@@ -234,18 +234,42 @@ def check_sheet_columns(client, sheet_id, sheet_name):
             if column.title:
                 column_map[column.title.lower()] = column.id
         
-        # Check for all required columns
+        # Check for all required columns with flexible matching
         required_found = {}
-        for req_col in REQUIRED_COLUMNS:
-            if req_col.lower() in column_map:
-                if req_col == "Dept #":
-                    required_found["dept"] = column_map[req_col.lower()]
-                elif req_col == "Work Request #":
-                    required_found["wr_num"] = column_map[req_col.lower()]
-                elif req_col == "Job #":
-                    required_found["job_num"] = column_map[req_col.lower()]
-            else:
-                return None  # Missing required column
+        missing_columns = []
+        
+        # Flexible column matching for Dept #
+        dept_variations = ["dept #", "dept#", "department #", "department#", "dept", "department"]
+        dept_found = False
+        for variation in dept_variations:
+            if variation in column_map:
+                required_found["dept"] = column_map[variation]
+                dept_found = True
+                break
+        if not dept_found:
+            missing_columns.append("Dept #")
+        
+        # Flexible column matching for Work Request #
+        wr_variations = ["work request #", "work request#", "wr #", "wr#", "work request", "wr", "work req #"]
+        wr_found = False
+        for variation in wr_variations:
+            if variation in column_map:
+                required_found["wr_num"] = column_map[variation]
+                wr_found = True
+                break
+        if not wr_found:
+            missing_columns.append("Work Request #")
+        
+        # Flexible column matching for Job #
+        job_variations = ["job #", "job#", "job", "job number", "job no", "job no."]
+        job_found = False
+        for variation in job_variations:
+            if variation in column_map:
+                required_found["job_num"] = column_map[variation]
+                job_found = True
+                break
+        if not job_found:
+            missing_columns.append("Job #")
         
         # Check optional helper columns
         helper_found = {}
@@ -256,12 +280,28 @@ def check_sheet_columns(client, sheet_id, sheet_name):
                 elif helper_col == "Helper Job [#]":
                     helper_found["helper_job_num"] = column_map[helper_col.lower()]
         
-        return {
-            'columns': {**required_found, **helper_found},
-            'has_helper_columns': ("helper_dept" in helper_found and "helper_job_num" in helper_found)
-        }
+        # Log partial matches for debugging
+        if len(required_found) > 0 and len(missing_columns) > 0:
+            found_cols = []
+            if "dept" in required_found:
+                found_cols.append("Dept")
+            if "wr_num" in required_found:
+                found_cols.append("Work Request")
+            if "job_num" in required_found:
+                found_cols.append("Job")
+            logging.info(f"  🔸 Partial match in '{sheet_name}': Found {found_cols}, Missing {missing_columns}")
         
-    except Exception:
+        # Only return if all required columns are found
+        if len(missing_columns) == 0:
+            return {
+                'columns': {**required_found, **helper_found},
+                'has_helper_columns': ("helper_dept" in helper_found and "helper_job_num" in helper_found)
+            }
+        else:
+            return None
+        
+    except Exception as e:
+        logging.debug(f"Error checking sheet '{sheet_name}': {e}")
         return None
 
 def fetch_sheet_rows(client, sheet_info, column_info):
