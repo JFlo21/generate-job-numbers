@@ -21,9 +21,9 @@ args = "Run Job Number Generator"
 name = "Run Job Number Generator"
 author = "agent"
 
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "python generate_job_numbers.py"
-
 [workflows.workflow.metadata]
 outputType = "console"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python generate_job_numbers_optimized.py"
