@@ -44,8 +44,8 @@ KNOWN_JOB_SHEET_IDS = [
 # OPTIMIZATION: Sheet name patterns to check (case-insensitive)
 # Only sheets with these patterns in their names will be checked
 SHEET_NAME_PATTERNS = [
-    "resiliency promax database",  # Primary pattern - only process these sheets
-    # Add more patterns as needed
+    "resiliency promax database",  # Primary pattern
+    "intake promax",                # Also process Intake Promax sheets
 ]
 
 # Set to True to discover new sheets, False to only use KNOWN_JOB_SHEET_IDS
