@@ -21,6 +21,10 @@ args = "Run Optimized Job Generator"
 task = "workflow.run"
 args = "Migrate Job Numbers to State Sheet"
 
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Run Fixed Job Generator"
+
 [[workflows.workflow]]
 name = "Run Optimized Job Generator"
 author = "agent"
@@ -39,6 +43,17 @@ author = "agent"
 [[workflows.workflow.tasks]]
 task = "shell.exec"
 args = "python migrate_existing_job_numbers.py"
+
+[workflows.workflow.metadata]
+outputType = "console"
+
+[[workflows.workflow]]
+name = "Run Fixed Job Generator"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python generate_job_numbers_fixed.py"
 
 [workflows.workflow.metadata]
 outputType = "console"

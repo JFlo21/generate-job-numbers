@@ -14,6 +14,14 @@ Python command-line application (no frontend)
 - Processes sheets from nested folders in the Linetec - Resiliency workspace
 - Handles both "Resiliency Promax Database" and "Intake Promax" sheets
 
+## Helper Job Numbering Logic (Fixed)
+- Helper job numbers are **sequential integers** (1, 2, 3...) NOT H-prefixed
+- Based on count of **unique Work Request #s** the department worked on
+- Includes BOTH:
+  - Jobs where department appears in Helper Dept # column
+  - Jobs where department appears as main Dept # column
+- Each unique Work Request # = one job in the counting sequence
+
 ## Performance Optimizations (v3 - Latest)
 - **JSON Caching System**: Stores discovered sheet metadata for instant loading on future runs
 - **Parallel Processing**: Uses ThreadPoolExecutor with 5 workers for concurrent operations
