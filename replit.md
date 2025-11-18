@@ -11,23 +11,24 @@ Python command-line application (no frontend)
 - Assigns job numbers based on department and work request numbers
 - Maintains state between runs using a Smartsheet state sheet
 - Supports optional helper columns (Helper Dept # and Helper Job [#])
-- Detects existing job number format and applies it to new assignments
-- Handles duplicate work requests across multiple sheets
+- Processes sheets from nested folders in the Linetec - Resiliency workspace
+- Handles both "Resiliency Promax Database" and "Intake Promax" sheets
 
-## Performance Optimizations (v2)
-- **Parallel Processing**: Uses ThreadPoolExecutor with 6 workers for concurrent sheet processing
-- **Cached Metadata**: Sheet discovery caches column information to avoid redundant API calls
-- **Selective Column Fetching**: Only fetches required columns instead of entire sheets
-- **Rate Limiting**: Implements intelligent rate limiting (300 req/min) with retry logic
-- **Batch Updates**: Processes updates in batches of 500 rows
-- **Progress Tracking**: Real-time progress updates and ETA calculations
-- **Performance Metrics**: Built-in timing instrumentation for bottleneck analysis
+## Performance Optimizations (v3 - Latest)
+- **JSON Caching System**: Stores discovered sheet metadata for instant loading on future runs
+- **Parallel Processing**: Uses ThreadPoolExecutor with 5 workers for concurrent operations
+- **Batch Operations**: Updates up to 500 rows in single API calls
+- **Smart Rate Limiting**: Enhanced rate limiter with burst capacity and request queuing
+- **Progress Tracking**: Real-time progress with percentage, ETA, and current sheet display
+- **Column ID Caching**: Eliminates redundant API calls for state sheet operations
+- **Self-Optimizing**: Gets faster with each run as cache builds up
 
 ### Performance Improvements
-- Reduced runtime from 2+ hours to ~15-20 minutes
-- Single sheet fetch per discovery (eliminated double-fetching)
-- Parallel processing of up to 6 sheets simultaneously
-- Respects Smartsheet API limits automatically
+- First run: ~10-15 minutes (discovery and caching)
+- Subsequent runs: ~3-5 minutes (using cached data)
+- Old version: 35+ minutes every run
+- Processes sheets from specific workspace folders only
+- Automatic cache persistence between runs
 
 ## Required Environment Variables
 - `SMARTSHEET_API_TOKEN`: Your Smartsheet API access token
