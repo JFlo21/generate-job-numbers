@@ -122,25 +122,71 @@ def should_exclude_value(value):
     return False
 
 def make_api_call(func, *args, **kwargs):
-    """Wrapper for API calls with rate limiting and error handling"""
+    """Wrapper for API calls with enhanced rate limiting and error handling"""
     rate_limiter.acquire()
-    max_retries = 3
-    retry_delay = 1
+    max_retries = 10  # Increased for better handling
+    base_delay = 1
     
     for attempt in range(max_retries):
         try:
+            # Log the API call for debugging (without sensitive data)
+            if hasattr(func, '__self__') and hasattr(func.__self__, '__class__'):
+                api_method = f"{func.__self__.__class__.__name__}.{func.__name__}"
+                if args and isinstance(args[0], (int, str)):
+                    logging.debug(f"API call: {api_method}({args[0]}...)")
+                    
             return func(*args, **kwargs)
+            
         except smartsheet.exceptions.ApiError as e:
-            if e.error.result.error_code == 4003:  # Rate limit error
-                wait_time = retry_delay * (2 ** attempt)
-                logging.warning(f"Rate limit hit, waiting {wait_time} seconds...")
+            error_code = getattr(e.error.result, 'error_code', None)
+            status_code = getattr(e.error.result, 'status_code', None)
+            
+            # Handle rate limiting (4003 error code or 429 status)
+            if error_code == 4003 or status_code == 429:
+                # Exponential backoff with max wait time
+                wait_time = min(base_delay * (2 ** attempt), 60)
+                
+                # Check for Retry-After header
+                if hasattr(e.error.result, 'headers'):
+                    retry_after = e.error.result.headers.get('Retry-After')
+                    if retry_after:
+                        wait_time = int(retry_after)
+                
+                logging.warning(f"⏳ Rate limit hit (attempt {attempt+1}/{max_retries}). Waiting {wait_time} seconds...")
                 time.sleep(wait_time)
+                continue
+                
+            # Handle service unavailable
+            elif status_code == 503:
+                wait_time = min(base_delay * (2 ** attempt), 30)
+                logging.warning(f"⚠️  Service unavailable. Waiting {wait_time} seconds...")
+                time.sleep(wait_time)
+                continue
+                
+            # Handle timeout or connection errors
+            elif status_code in [408, 502, 504]:
+                wait_time = min(base_delay * (2 ** attempt), 20)
+                logging.warning(f"⏱️  Timeout/Gateway error. Waiting {wait_time} seconds...")
+                time.sleep(wait_time)
+                continue
             else:
+                logging.error(f"API Error (code: {error_code}, status: {status_code}): {e}")
                 raise
+                
+        except (ConnectionError, TimeoutError) as e:
+            if attempt < max_retries - 1:
+                wait_time = min(base_delay * (2 ** attempt), 10)
+                logging.warning(f"🔌 Connection error. Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+                continue
+            raise
+            
         except Exception as e:
-            if attempt == max_retries - 1:
-                raise
-            time.sleep(retry_delay)
+            logging.error(f"Unexpected error: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(base_delay)
+                continue
+            raise
     
     raise Exception(f"Failed after {max_retries} attempts")
 
