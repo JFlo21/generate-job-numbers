@@ -51,6 +51,10 @@ SHEET_NAME_PATTERNS = [
 # Set to True to discover new sheets, False to only use KNOWN_JOB_SHEET_IDS
 ENABLE_DISCOVERY = True  # ENABLED - Discover all sheets with required columns
 
+# Set to None to process sheets from ALL locations (including personal Sheets folder)
+# Set to a specific workspace ID to limit to that workspace only
+TARGET_WORKSPACE_ID = None  # Process sheets from all locations
+
 STATE_SHEET_ID = 6534534683119492
 STATE_COLUMN_NAMES = {
     'key': 'key',
@@ -174,19 +178,61 @@ def get_sheets_to_process(client):
         total_sheets = len(sheets_response.data)
         logging.info(f"Found {total_sheets} total sheets")
         
-        # First, filter by name patterns
         candidates = []
-        for sheet_info in sheets_response.data:
-            if sheet_info.id == STATE_SHEET_ID:
-                continue
-                
-            if should_check_sheet(sheet_info.name):
-                candidates.append({
-                    'sheet_id': sheet_info.id,
-                    'sheet_name': sheet_info.name
-                })
         
-        logging.info(f"Filtered to {len(candidates)} candidate sheets based on name patterns")
+        if TARGET_WORKSPACE_ID:
+            # Filter by specific workspace
+            logging.info(f"Filtering to workspace ID: {TARGET_WORKSPACE_ID}")
+            
+            # Get list of sheets in target workspace
+            workspace_sheets = []
+            try:
+                # Get workspace sheets
+                workspace_response = make_api_call(client.Workspaces.get_workspace, TARGET_WORKSPACE_ID, 
+                                                 load_all=True, include='sheets')
+                if workspace_response.sheets:
+                    workspace_sheet_ids = set(sheet.id for sheet in workspace_response.sheets)
+                    logging.info(f"Found {len(workspace_sheet_ids)} sheets in target workspace")
+                else:
+                    workspace_sheet_ids = set()
+                    logging.warning("No sheets found in target workspace")
+            except Exception as e:
+                logging.error(f"Could not get workspace sheets: {e}")
+                workspace_sheet_ids = set()
+            
+            # Filter by workspace AND name patterns
+            workspace_matches = 0
+            for sheet_info in sheets_response.data:
+                if sheet_info.id == STATE_SHEET_ID:
+                    continue
+                
+                # Check if sheet is in target workspace
+                if sheet_info.id in workspace_sheet_ids:
+                    workspace_matches += 1
+                    if should_check_sheet(sheet_info.name):
+                        candidates.append({
+                            'sheet_id': sheet_info.id,
+                            'sheet_name': sheet_info.name
+                        })
+            
+            logging.info(f"Found {workspace_matches} sheets in workspace {TARGET_WORKSPACE_ID}")
+            logging.info(f"Filtered to {len(candidates)} candidate sheets based on workspace + name patterns")
+        else:
+            # No workspace filter - check all sheets
+            logging.info("Processing sheets from ALL locations (including personal Sheets folder)")
+            
+            # Filter by name patterns only
+            for sheet_info in sheets_response.data:
+                if sheet_info.id == STATE_SHEET_ID:
+                    continue
+                    
+                if should_check_sheet(sheet_info.name):
+                    candidates.append({
+                        'sheet_id': sheet_info.id,
+                        'sheet_name': sheet_info.name
+                    })
+            
+            logging.info(f"Filtered to {len(candidates)} candidate sheets based on name patterns")
         
         if len(candidates) > 50:
             logging.warning(f"Still have {len(candidates)} sheets to check. Consider adding known sheet IDs to KNOWN_JOB_SHEET_IDS")
