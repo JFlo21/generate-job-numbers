@@ -44,13 +44,7 @@ KNOWN_JOB_SHEET_IDS = [
 # OPTIMIZATION: Sheet name patterns to check (case-insensitive)
 # Only sheets with these patterns in their names will be checked
 SHEET_NAME_PATTERNS = [
-    "job",
-    "work request",
-    "wr",
-    "dept",
-    "department",
-    "project",
-    "task",
+    "resiliency promax database",  # Primary pattern - only process these sheets
     # Add more patterns as needed
 ]
 
@@ -234,68 +228,58 @@ def check_sheet_columns(client, sheet_id, sheet_name):
             if column.title:
                 column_map[column.title.lower()] = column.id
         
-        # Check for all required columns with flexible matching
+        # For Resiliency Promax Database sheets, look for exact column names
         required_found = {}
         missing_columns = []
         
-        # Flexible column matching for Dept #
-        dept_variations = ["dept #", "dept#", "department #", "department#", "dept", "department"]
-        dept_found = False
-        for variation in dept_variations:
-            if variation in column_map:
-                required_found["dept"] = column_map[variation]
-                dept_found = True
-                break
-        if not dept_found:
+        # Check for exact Dept # column
+        if "dept #" in column_map:
+            required_found["dept"] = column_map["dept #"]
+        else:
             missing_columns.append("Dept #")
         
-        # Flexible column matching for Work Request #
-        wr_variations = ["work request #", "work request#", "wr #", "wr#", "work request", "wr", "work req #"]
-        wr_found = False
-        for variation in wr_variations:
-            if variation in column_map:
-                required_found["wr_num"] = column_map[variation]
-                wr_found = True
-                break
-        if not wr_found:
+        # Check for exact Work Request # column
+        if "work request #" in column_map:
+            required_found["wr_num"] = column_map["work request #"]
+        else:
             missing_columns.append("Work Request #")
         
-        # Flexible column matching for Job #
-        job_variations = ["job #", "job#", "job", "job number", "job no", "job no."]
-        job_found = False
-        for variation in job_variations:
-            if variation in column_map:
-                required_found["job_num"] = column_map[variation]
-                job_found = True
-                break
-        if not job_found:
+        # Check for exact Job # column
+        if "job #" in column_map:
+            required_found["job_num"] = column_map["job #"]
+        else:
             missing_columns.append("Job #")
         
-        # Check optional helper columns
+        # Check for helper columns (exact match)
         helper_found = {}
-        for helper_col in OPTIONAL_HELPER_COLUMNS:
-            if helper_col.lower() in column_map:
-                if helper_col == "Helper Dept #":
-                    helper_found["helper_dept"] = column_map[helper_col.lower()]
-                elif helper_col == "Helper Job [#]":
-                    helper_found["helper_job_num"] = column_map[helper_col.lower()]
+        if "helper dept #" in column_map:
+            helper_found["helper_dept"] = column_map["helper dept #"]
+            logging.info(f"  ✅ Found Helper Dept # column in '{sheet_name}'")
         
-        # Log partial matches for debugging
-        if len(required_found) > 0 and len(missing_columns) > 0:
+        if "helper job [#]" in column_map:
+            helper_found["helper_job_num"] = column_map["helper job [#]"]
+            logging.info(f"  ✅ Found Helper Job [#] column in '{sheet_name}'")
+        
+        # Log what was found
+        if len(missing_columns) == 0:
+            logging.info(f"  ✅ Found all required columns in '{sheet_name}'")
+            if len(helper_found) > 0:
+                logging.info(f"  ✅ Also has {len(helper_found)} helper column(s)")
+        elif len(required_found) > 0:
             found_cols = []
             if "dept" in required_found:
-                found_cols.append("Dept")
+                found_cols.append("Dept #")
             if "wr_num" in required_found:
-                found_cols.append("Work Request")
+                found_cols.append("Work Request #")
             if "job_num" in required_found:
-                found_cols.append("Job")
+                found_cols.append("Job #")
             logging.info(f"  🔸 Partial match in '{sheet_name}': Found {found_cols}, Missing {missing_columns}")
         
         # Only return if all required columns are found
         if len(missing_columns) == 0:
             return {
                 'columns': {**required_found, **helper_found},
-                'has_helper_columns': ("helper_dept" in helper_found and "helper_job_num" in helper_found)
+                'has_helper_columns': len(helper_found) == 2
             }
         else:
             return None
