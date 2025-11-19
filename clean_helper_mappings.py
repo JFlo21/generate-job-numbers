@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Clean up incorrect helper job mappings from state sheet.
-Removes entries with "H00001" style format that need to be regenerated.
+Removes helper entries that are plain integers (should be dept-sequence format).
 """
 
 import smartsheet
@@ -30,7 +30,7 @@ def main():
     # Get the state sheet
     sheet = client.Sheets.get_sheet(STATE_SHEET_ID, include='rows')
     
-    # Find rows to delete (those with H-prefix values)
+    # Find rows to delete (helper entries with plain integer values)
     rows_to_delete = []
     helper_count = 0
     
@@ -45,11 +45,14 @@ def main():
             elif col_name.lower() == 'generated number':
                 number = cell.value
         
-        # Delete rows with H-prefix numbers (incorrect format)
-        if number and str(number).startswith('H'):
-            rows_to_delete.append(row.id)
-            helper_count += 1
-            logging.info(f"  Found incorrect helper mapping: {key} = {number}")
+        # Delete helper rows with plain integer values (incorrect format)
+        # Correct format should be "dept-sequence" e.g., "717-2"
+        if key and key.startswith('HELPER|') and number:
+            # Check if it's a plain integer (wrong) vs dept-sequence format (correct)
+            if str(number).isdigit() or str(number).startswith('H'):
+                rows_to_delete.append(row.id)
+                helper_count += 1
+                logging.info(f"  Found incorrect helper mapping: {key} = {number}")
     
     if rows_to_delete:
         logging.info(f"\n🗑️ Deleting {len(rows_to_delete)} incorrect helper mappings...")
