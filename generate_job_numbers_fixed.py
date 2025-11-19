@@ -220,6 +220,7 @@ class StateTracker:
         Get or create helper job number based on unique Work Request # count.
         This counts how many unique work requests this department has worked on
         (either as main dept or as helper dept).
+        Returns format: "{dept}-{sequence}" e.g., "717-2"
         """
         with self.lock:
             # Track this work request for the helper department
@@ -232,18 +233,21 @@ class StateTracker:
             
             # Count unique work requests for this department (position in list = job number)
             unique_work_requests = self.dept_work_requests[helper_dept]
-            job_number = len(unique_work_requests)  # Sequential integer based on count
+            sequence_number = len(unique_work_requests)  # Sequential integer based on count
+            
+            # Format as "{dept}-{sequence}"
+            job_number = f"{helper_dept}-{sequence_number}"
             
             # Store the mapping
             if helper_dept not in self.dept_job_numbers:
                 self.dept_job_numbers[helper_dept] = {}
-            self.dept_job_numbers[helper_dept][work_request] = str(job_number)
+            self.dept_job_numbers[helper_dept][work_request] = job_number
             
             # Save to state sheet with new key format
             key = f"HELPER|{helper_dept}|{work_request}"
-            self.save_number(key, str(job_number))
+            self.save_number(key, job_number)
             
-            return str(job_number)
+            return job_number
     
     def save_number(self, key: str, number: str):
         """Save a single number to state sheet"""
@@ -490,17 +494,19 @@ def process_sheet_batch(client, sheet_info: CachedSheet, state_tracker: StateTra
             )
             stats["numbers_generated"] += 1
         
-        # Process helper job number (with CORRECTED logic)
-        if sheet_info.has_helper_columns and helper_dept_val and work_req_val and not helper_job_val:
-            helper_number = state_tracker.get_or_create_helper_number(str(helper_dept_val), str(work_req_val))
+        # Process helper job number (with CORRECTED logic and overwrite mismatches)
+        if sheet_info.has_helper_columns and helper_dept_val and work_req_val:
+            expected_helper_number = state_tracker.get_or_create_helper_number(str(helper_dept_val), str(work_req_val))
             
-            cells_to_update.append(
-                client.models.Cell({
-                    'column_id': sheet_info.columns['helper_job'],
-                    'value': helper_number
-                })
-            )
-            stats["numbers_generated"] += 1
+            # Update if empty OR if value doesn't match expected
+            if not helper_job_val or str(helper_job_val) != expected_helper_number:
+                cells_to_update.append(
+                    client.models.Cell({
+                        'column_id': sheet_info.columns['helper_job'],
+                        'value': expected_helper_number
+                    })
+                )
+                stats["numbers_generated"] += 1
         
         # Update row if needed
         if cells_to_update:
