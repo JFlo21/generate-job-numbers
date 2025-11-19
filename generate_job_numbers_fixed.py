@@ -223,27 +223,34 @@ class StateTracker:
         Returns format: "{dept}-{sequence}" e.g., "717-2"
         """
         with self.lock:
-            # Track this work request for the helper department
-            if work_request not in self.dept_work_requests[helper_dept]:
-                self.dept_work_requests[helper_dept].append(work_request)
+            # Convert department to clean integer (remove .0 from floats)
+            try:
+                dept_int = int(float(helper_dept))
+                clean_dept = str(dept_int)
+            except (ValueError, TypeError):
+                clean_dept = helper_dept
+            
+            # Track this work request for the department
+            if work_request not in self.dept_work_requests[clean_dept]:
+                self.dept_work_requests[clean_dept].append(work_request)
             
             # Check if we already have a job number for this dept/work_request
-            if helper_dept in self.dept_job_numbers and work_request in self.dept_job_numbers[helper_dept]:
-                return self.dept_job_numbers[helper_dept][work_request]
+            if clean_dept in self.dept_job_numbers and work_request in self.dept_job_numbers[clean_dept]:
+                return self.dept_job_numbers[clean_dept][work_request]
             
             # Count unique work requests for this department (position in list = job number)
-            unique_work_requests = self.dept_work_requests[helper_dept]
+            unique_work_requests = self.dept_work_requests[clean_dept]
             sequence_number = len(unique_work_requests)  # Sequential integer based on count
             
-            # Format as "{dept}-{sequence}"
-            job_number = f"{helper_dept}-{sequence_number}"
+            # Format as "{dept}-{sequence}" with clean integer dept
+            job_number = f"{clean_dept}-{sequence_number}"
             
             # Store the mapping
-            if helper_dept not in self.dept_job_numbers:
-                self.dept_job_numbers[helper_dept] = {}
-            self.dept_job_numbers[helper_dept][work_request] = job_number
+            if clean_dept not in self.dept_job_numbers:
+                self.dept_job_numbers[clean_dept] = {}
+            self.dept_job_numbers[clean_dept][work_request] = job_number
             
-            # Save to state sheet with new key format
+            # Save to state sheet with new key format (use original helper_dept for key)
             key = f"HELPER|{helper_dept}|{work_request}"
             self.save_number(key, job_number)
             
@@ -276,8 +283,8 @@ class StateTracker:
 
 def make_api_call(func, *args, **kwargs):
     """Make an API call with rate limiting and retries"""
-    max_retries = 3
-    base_delay = 1.0
+    max_retries = 5  # Increased for better handling of 502 errors
+    base_delay = 2.0  # Increased delay between retries
     
     for attempt in range(max_retries):
         try:
@@ -285,8 +292,17 @@ def make_api_call(func, *args, **kwargs):
             result = func(*args, **kwargs)
             return result
         except Exception as e:
-            if attempt < max_retries - 1:
-                time.sleep(base_delay * (2 ** attempt))
+            error_msg = str(e)
+            # Check if it's a 502 Bad Gateway error
+            if '502' in error_msg or 'Bad Gateway' in error_msg:
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    logging.warning(f"502 Bad Gateway error, retrying in {delay}s (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(delay)
+                    continue
+            # For other errors, retry with shorter delay
+            elif attempt < max_retries - 1:
+                time.sleep(base_delay)
                 continue
             raise
     
