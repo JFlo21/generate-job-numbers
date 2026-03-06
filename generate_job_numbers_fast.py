@@ -228,7 +228,7 @@ def get_sheets_to_process(client):
         
         # Get list of all sheets
         # Migrated from deprecated include_all=True — sunset June 3, 2026
-        all_sheets = list_all_sheets(client)
+        all_sheets = list_all_sheets(client, api_call_wrapper=make_api_call)
         total_sheets = len(all_sheets)
         logging.info(f"Found {total_sheets} total sheets")
         

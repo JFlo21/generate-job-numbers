@@ -425,7 +425,7 @@ def discover_sheets_parallel(client) -> List[CachedSheet]:
     
     # Get all sheets to match names
     # Migrated from deprecated include_all=True — sunset June 3, 2026
-    all_sheets = list_all_sheets(client)
+    all_sheets = list_all_sheets(client, api_call_wrapper=make_api_call)
     
     # Filter candidate sheets
     candidates = []
