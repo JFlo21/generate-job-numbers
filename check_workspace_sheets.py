@@ -1,6 +1,7 @@
 """Check what sheets are in the specified workspace"""
 import os
 import smartsheet
+from ss_api_helpers import get_workspace_children, get_workspace_metadata
 
 API_TOKEN = os.getenv("SMARTSHEET_API_TOKEN")
 client = smartsheet.Smartsheet(API_TOKEN)
@@ -12,10 +13,12 @@ print(f"CHECKING WORKSPACE ID: {WORKSPACE_ID}")
 print("=" * 60)
 
 try:
-    # Get workspace with sheets
-    workspace = client.Workspaces.get_workspace(WORKSPACE_ID, load_all=True, include='sheets')
+    # Get workspace metadata (name) and sheets separately
+    # Migrated from deprecated load_all=True — sunset June 3, 2026
+    workspace_meta = get_workspace_metadata(WORKSPACE_ID)
+    workspace = get_workspace_children(WORKSPACE_ID, resource_types="sheets")
     
-    print(f"\n📁 Workspace Name: {workspace.name}")
+    print(f"\n📁 Workspace Name: {workspace_meta.name}")
     print(f"📊 Number of sheets: {len(workspace.sheets) if workspace.sheets else 0}")
     
     if workspace.sheets:

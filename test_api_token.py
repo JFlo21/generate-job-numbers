@@ -17,12 +17,22 @@ try:
     print(f"Account type: {user.account.account_type}")
     
     # Try to list sheets
-    sheets = client.Sheets.list_sheets(include_all=True)
-    print(f"\n📊 Found {len(sheets.data)} sheets in your account")
+    # Migrated from deprecated include_all=True — sunset June 3, 2026
+    all_sheets = []
+    page_number = 1
+    while True:
+        response = client.Sheets.list_sheets(page_size=100, page=page_number)
+        if not response.data:
+            break
+        all_sheets.extend(response.data)
+        if len(response.data) < 100:
+            break
+        page_number += 1
+    print(f"\n📊 Found {len(all_sheets)} sheets in your account")
     
     # Show a few sheet names
     print("\nFirst 5 sheets:")
-    for sheet in sheets.data[:5]:
+    for sheet in all_sheets[:5]:
         print(f"  - {sheet.name} (ID: {sheet.id})")
         
     print("\n✨ API token is working perfectly! The optimized script should run successfully.")

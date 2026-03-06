@@ -1,6 +1,7 @@
 """Find which workspace contains the Resiliency Promax Database sheets"""
 import os
 import smartsheet
+from ss_api_helpers import list_all_workspaces, get_workspace_children
 
 API_TOKEN = os.getenv("SMARTSHEET_API_TOKEN")
 client = smartsheet.Smartsheet(API_TOKEN)
@@ -21,15 +22,17 @@ try:
     print("\nChecking workspace for known Resiliency Promax Database sheets...")
     
     # Get all workspaces
-    workspaces = client.Workspaces.list_workspaces(include_all=True)
-    print(f"Found {len(workspaces.data)} workspaces total\n")
+    # Migrated from deprecated include_all=True — sunset June 3, 2026
+    all_workspaces = list_all_workspaces(client)
+    print(f"Found {len(all_workspaces)} workspaces total\n")
     
     workspace_found = None
     
-    for workspace_info in workspaces.data:
+    for workspace_info in all_workspaces:
         try:
             # Get workspace with sheets
-            workspace = client.Workspaces.get_workspace(workspace_info.id, load_all=True, include='sheets')
+            # Migrated from deprecated load_all=True — sunset June 3, 2026
+            workspace = get_workspace_children(workspace_info.id, resource_types="sheets")
             
             if workspace.sheets:
                 # Check if any known sheet is in this workspace
@@ -38,7 +41,7 @@ try:
                 
                 if matching_sheets:
                     workspace_found = workspace_info.id
-                    print(f"✅ FOUND! Workspace: {workspace.name}")
+                    print(f"✅ FOUND! Workspace: {workspace_info.name}")
                     print(f"   Workspace ID: {workspace_info.id}")
                     print(f"   Contains {len(matching_sheets)} known Resiliency Promax Database sheets")
                     

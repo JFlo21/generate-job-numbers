@@ -37,6 +37,7 @@ import smartsheet
 import logging
 import json
 from collections import defaultdict
+from ss_api_helpers import list_all_sheets
 
 API_TOKEN = os.getenv("SMARTSHEET_API_TOKEN")
 
@@ -99,10 +100,11 @@ def discover_target_sheets(client):
     
     try:
         # Get list of all sheets the user has access to
-        sheets_response = client.Sheets.list_sheets(include_all=True)
-        logging.info(f"Found {len(sheets_response.data)} total sheets to check")
+        # Migrated from deprecated include_all=True — sunset June 3, 2026
+        all_sheets = list_all_sheets(client)
+        logging.info(f"Found {len(all_sheets)} total sheets to check")
         
-        for sheet_info in sheets_response.data:
+        for sheet_info in all_sheets:
             sheet_id = sheet_info.id
             sheet_name = sheet_info.name
             
