@@ -16,6 +16,7 @@ from typing import Dict, List, Set, Optional, Tuple
 from dataclasses import dataclass, asdict
 import random
 from collections import deque
+from ss_api_helpers import list_all_sheets, get_folder_children
 
 # Configure logging
 logging.basicConfig(
@@ -317,8 +318,9 @@ def discover_sheets_parallel(client) -> List[CachedSheet]:
     logging.info("🔍 Starting parallel sheet discovery...")
     
     # Get all sheets
-    sheets_response = make_api_call(client.Sheets.list_sheets, include_all=True)
-    total_sheets = sheets_response.total_count
+    # Migrated from deprecated include_all=True — sunset June 3, 2026
+    all_sheets = list_all_sheets(client, api_call_wrapper=make_api_call)
+    total_sheets = len(all_sheets)
     logging.info(f"Found {total_sheets} total sheets")
     
     # Get sheets from target folders
@@ -328,7 +330,8 @@ def discover_sheets_parallel(client) -> List[CachedSheet]:
         logging.info(f"Looking in folders: {TARGET_FOLDER_IDS}")
         for folder_id in TARGET_FOLDER_IDS:
             try:
-                folder = make_api_call(client.Folders.get_folder, folder_id)
+                # Migrated from deprecated get_folder SDK call — sunset June 3, 2026
+                folder = get_folder_children(folder_id)
                 if folder.sheets:
                     for sheet in folder.sheets:
                         workspace_sheet_ids.add(sheet.id)
@@ -338,7 +341,8 @@ def discover_sheets_parallel(client) -> List[CachedSheet]:
                 if folder.folders:
                     for subfolder in folder.folders:
                         try:
-                            sub = make_api_call(client.Folders.get_folder, subfolder.id)
+                            # Migrated from deprecated get_folder SDK call — sunset June 3, 2026
+                            sub = get_folder_children(subfolder.id)
                             if sub.sheets:
                                 for sheet in sub.sheets:
                                     workspace_sheet_ids.add(sheet.id)
@@ -350,7 +354,7 @@ def discover_sheets_parallel(client) -> List[CachedSheet]:
     
     # Filter candidate sheets
     candidates = []
-    for sheet_info in sheets_response.data:
+    for sheet_info in all_sheets:
         if sheet_info.id in workspace_sheet_ids and should_check_sheet(sheet_info.name):
             candidates.append((sheet_info.id, sheet_info.name))
     

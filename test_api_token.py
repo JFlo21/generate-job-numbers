@@ -2,6 +2,7 @@
 """Quick test to verify Smartsheet API token is working"""
 import smartsheet
 import sys
+from ss_api_helpers import list_all_sheets
 
 # Directly use the provided token for this test
 API_TOKEN = "rmMxBWoAniodcEE77JatH9qfXPRXSxPzCiizx"
@@ -17,12 +18,13 @@ try:
     print(f"Account type: {user.account.account_type}")
     
     # Try to list sheets
-    sheets = client.Sheets.list_sheets(include_all=True)
-    print(f"\n📊 Found {len(sheets.data)} sheets in your account")
+    # Migrated from deprecated include_all=True — sunset June 3, 2026
+    all_sheets = list_all_sheets(client)
+    print(f"\n📊 Found {len(all_sheets)} sheets in your account")
     
     # Show a few sheet names
     print("\nFirst 5 sheets:")
-    for sheet in sheets.data[:5]:
+    for sheet in all_sheets[:5]:
         print(f"  - {sheet.name} (ID: {sheet.id})")
         
     print("\n✨ API token is working perfectly! The optimized script should run successfully.")

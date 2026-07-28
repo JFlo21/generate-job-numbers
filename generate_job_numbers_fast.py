@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock, Semaphore
 from datetime import datetime, timedelta
 import sys
+from ss_api_helpers import list_all_sheets, get_folder_children, get_workspace_children
 
 API_TOKEN = os.getenv("SMARTSHEET_API_TOKEN")
 
@@ -226,8 +227,9 @@ def get_sheets_to_process(client):
         logging.info("Discovering sheets with job number columns...")
         
         # Get list of all sheets
-        sheets_response = make_api_call(client.Sheets.list_sheets, include_all=True)
-        total_sheets = len(sheets_response.data)
+        # Migrated from deprecated include_all=True — sunset June 3, 2026
+        all_sheets = list_all_sheets(client, api_call_wrapper=make_api_call)
+        total_sheets = len(all_sheets)
         logging.info(f"Found {total_sheets} total sheets")
         
         candidates = []
@@ -245,7 +247,8 @@ def get_sheets_to_process(client):
                 for folder_id in TARGET_FOLDER_IDS:
                     try:
                         # Get folder contents
-                        folder_response = make_api_call(client.Folders.get_folder, folder_id)
+                        # Migrated from deprecated get_folder SDK call — sunset June 3, 2026
+                        folder_response = get_folder_children(folder_id)
                         
                         # Add sheets in this folder
                         if folder_response.sheets:
@@ -257,7 +260,8 @@ def get_sheets_to_process(client):
                         if folder_response.folders:
                             for subfolder in folder_response.folders:
                                 try:
-                                    subfolder_response = make_api_call(client.Folders.get_folder, subfolder.id)
+                                    # Migrated from deprecated get_folder SDK call — sunset June 3, 2026
+                                    subfolder_response = get_folder_children(subfolder.id)
                                     if subfolder_response.sheets:
                                         for sheet in subfolder_response.sheets:
                                             workspace_sheet_ids.add(sheet.id)
@@ -270,10 +274,10 @@ def get_sheets_to_process(client):
                 logging.info(f"Total sheets found in folders: {len(workspace_sheet_ids)}")
             
             else:
-                # Get workspace root sheets (old method)
+                # Get workspace root sheets
                 try:
-                    workspace_response = make_api_call(client.Workspaces.get_workspace, TARGET_WORKSPACE_ID, 
-                                                     load_all=True, include='sheets')
+                    # Migrated from deprecated load_all=True — sunset June 3, 2026
+                    workspace_response = get_workspace_children(TARGET_WORKSPACE_ID, resource_types="sheets")
                     if workspace_response.sheets:
                         workspace_sheet_ids = set(sheet.id for sheet in workspace_response.sheets)
                         logging.info(f"Found {len(workspace_sheet_ids)} sheets in target workspace root")
@@ -286,7 +290,7 @@ def get_sheets_to_process(client):
             
             # Filter by workspace AND name patterns
             workspace_matches = 0
-            for sheet_info in sheets_response.data:
+            for sheet_info in all_sheets:
                 if sheet_info.id == STATE_SHEET_ID:
                     continue
                 
@@ -306,7 +310,7 @@ def get_sheets_to_process(client):
             logging.info("Processing sheets from ALL locations (including personal Sheets folder)")
             
             # Filter by name patterns only
-            for sheet_info in sheets_response.data:
+            for sheet_info in all_sheets:
                 if sheet_info.id == STATE_SHEET_ID:
                     continue
                     
